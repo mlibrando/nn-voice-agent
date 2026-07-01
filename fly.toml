@@ -1,0 +1,40 @@
+# Fly.io app config for the Natural Nutrition voice-agent bridge.
+#
+# Region: iad (Ashburn, VA). Rationale — Twilio's primary US carrier + Media Streams
+# edge sits in us-east-1, and OpenAI's Realtime API's US infra is heavily us-east.
+# Ashburn is one of the largest internet exchanges on the planet, so peering to both
+# is excellent. sjc would work but adds ~60ms coast-to-coast for the Twilio hop.
+#
+# NOTE: `app` name may collide on first `fly launch` — flyctl will suggest an
+# alternative. Update this line to whatever you accept.
+
+app            = "nn-voice-agent"
+primary_region = "iad"
+
+[build]
+
+# HTTP service — websockets ride on the same handler. Fly's edge supports WS natively;
+# no special config beyond `internal_port` matching the Dockerfile.
+[http_service]
+  internal_port       = 8080
+  force_https         = true
+  # Stay warm. Evaluators cold-call the number; a scale-to-zero cold-start would
+  # make the first ~5s of the demo dead air.
+  auto_stop_machines  = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+  processes           = ["app"]
+
+  # Concurrency uses *connections* (not requests) — a live call is one long-lived WS.
+  # Bump ceilings above the default (25) so parallel evaluator calls aren't rejected
+  # at the edge. This is not scale-out; it's the per-machine ceiling.
+  [http_service.concurrency]
+    type       = "connections"
+    soft_limit = 25
+    hard_limit = 50
+
+# Small shared VM is plenty for a demo bridge holding ~2 WS per active call plus
+# uvicorn + fastapi. 512MB gives headroom over the 256MB default without wasting money.
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "512mb"
