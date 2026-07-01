@@ -12,9 +12,11 @@ import json
 import base64
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import certifi
+import httpx
 import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse
@@ -26,14 +28,19 @@ load_dotenv()
 # Config
 # ---------------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PORT = int(os.getenv("PORT", 5050))
+PORT = int(os.getenv("PORT", 8080))
+
+# Mock backend base URL. Local dev defaults to localhost:8001; on Fly, set via
+# `fly secrets set MOCK_BACKEND_URL=http://nn-mock-backend.internal:8001` so
+# the bridge reaches the mock over 6PN (private, no public exposure).
+MOCK_BACKEND_URL = os.getenv("MOCK_BACKEND_URL", "http://localhost:8001").rstrip("/")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is required — add it to .env")
 
 # OpenAI Realtime
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
-VOICE = "ash"  # Options: ash, ballad, coral, sage, verse — test a few on Day 9
+VOICE = "marin"  # Options: ash, ballad, coral, sage, verse — test a few on Day 9
 
 SYSTEM_MESSAGE = """
 You are Ashley, a friendly and efficient customer support agent for Natural Nutrition,
@@ -61,9 +68,26 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s  %(mes
 log = logging.getLogger("voice-agent")
 
 # ---------------------------------------------------------------------------
+# Startup mock-backend reachability probe (disposable — Day 3's tool layer
+# will replace this with the real HTTP client that actually uses the mock).
+# One GET /health at boot, log the result, keep going either way.
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    url = f"{MOCK_BACKEND_URL}/health"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(url)
+        log.info(f"Mock backend reachable at {url} — {r.status_code} {r.text}")
+    except Exception as e:
+        log.warning(f"Mock backend NOT reachable at {url}: {e.__class__.__name__}: {e}")
+    yield
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Natural Nutrition Voice Agent")
+app = FastAPI(title="Natural Nutrition Voice Agent", lifespan=lifespan)
 
 
 @app.get("/", response_class=HTMLResponse)
