@@ -1,0 +1,53 @@
+# Secrets — never bake into the image. Fly secrets provide these at runtime.
+.env
+.env.*
+!env.example
+
+# Python local state
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# VCS + editor
+.git/
+.gitignore
+.gitattributes
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project docs — not needed at runtime, keeps the image small.
+CLAUDE.md
+PLAN.md
+DEPLOY.md
+DECISIONS.md
+INTERFACE.md
+README.md
+
+# Agent state / local scratch
+.claude/
+.claude-personal/
+
+# Runtime output that should never be in the build context
+*.log
+logs/
+recordings/
+transcripts/
+*.wav
+*.mp3
+*.sqlite
+*.sqlite3
+*.db
+
+# Fly local state
+.fly/
+fly.toml.bak
