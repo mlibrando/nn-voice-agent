@@ -24,14 +24,6 @@ Thumbs.db
 *.swp
 *.swo
 
-# Project docs / planning (local-only)
-CLAUDE.md
-PLAN.md
-INTERFACE.md
-DECISIONS.md
-*.md
-!README.md
-
 # Claude / agent state
 .claude/
 .claude-personal/
