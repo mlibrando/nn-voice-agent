@@ -20,6 +20,7 @@ from app.config import (
     SESSION_UPDATE_PAYLOAD,
 )
 from app.session import new_session
+from app.tools import handlers as tool_handlers
 
 log = logging.getLogger(__name__)
 
@@ -141,6 +142,34 @@ async def _openai_to_twilio(
                 session["active_response"] = False
                 if event_type in LOG_EVENTS:
                     log.info(f"OpenAI event: {event_type}")
+
+            # --- Function calling: model wants to invoke a tool ---
+            elif event_type == "response.function_call_arguments.done":
+                # TODO Day 6: emit a spoken filler here on tool dispatch — a
+                # short response.create with an ack-only instruction (in the
+                # model's own voice) before we await the mock. This is the
+                # deterministic cover for §3's tool-call dead-air window.
+                call_id = msg.get("call_id")
+                name = msg.get("name")
+                args_json = msg.get("arguments", "{}")
+                try:
+                    args = json.loads(args_json) if args_json else {}
+                except json.JSONDecodeError:
+                    args = {}
+                log.info(f"Tool call: {name}({args_json})")
+                result = await tool_handlers.dispatch(name, args, session)
+                log.info(f"Tool result: {name} -> ok={result.get('ok')}")
+                # 1. Return the result to the model
+                await openai_ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps(result),
+                    },
+                }))
+                # 2. Ask the model to speak with the result in hand
+                await openai_ws.send(json.dumps({"type": "response.create"}))
 
             # --- Barge-in: only cancel + clear when a response is actually in flight ---
             elif event_type == "input_audio_buffer.speech_started":

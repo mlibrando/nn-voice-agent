@@ -4,12 +4,18 @@
 **Source of truth for tools/data:** `INTERFACE.md`. Every field name below is taken verbatim from it.
 **Deadline:** Mon Jul 13, 10:00 AM ET. **Working days:** Jun 29 – Jul 10 (10 days), Jul 11–12 buffer.
 
+> **Rev note — AIA pass (Jul 2):** integrated the *Ashley in Action* showcase (11 real text-Ashley
+> conversations). Added KNOW-1, EXPL-1, RETN-2, SAFE-3; the `medical_issue` enum trap (§5 / SAFE-1);
+> reference-system auth evidence + the text→voice "act-first" channel note (§4); grounded CX examples +
+> the deliberate "spoke-with-my-manager" divergence (§4.5); wired into Days 5/8; Risks #15–18.
+
 ---
 
 ## 1. Requirements Matrix
 
 Each requirement has an ID, a source for traceability, and a priority. Sources:
-`BRIEF` = presentation deck, `KICK` = kickoff transcript, `README` = repo README, `IFACE` = INTERFACE.md.
+`BRIEF` = presentation deck, `KICK` = kickoff transcript, `README` = repo README, `IFACE` = INTERFACE.md,
+`AIA` = *Ashley in Action* showcase (11 real text-Ashley conversations, all resolved autonomously).
 
 | ID | Requirement | Source | Priority |
 |----|-------------|--------|----------|
@@ -39,6 +45,9 @@ Each requirement has an ID, a source for traceability, and a priority. Sources:
 | TOOL-15 | `save_transcript`. | README, IFACE 2.9 | P0 |
 | TOOL-ERR | Graceful handling of injected latency + 7% `503`s: bounded retry/backoff, never improvise an outcome. | BRIEF, IFACE §5 | P0 |
 | RETN-1 | Retention sequence mirrors Ashley: capture reason, offer discount/pause before cancel where appropriate. | BRIEF (Ashley-in-action), `variant_a` | P1 |
+| RETN-2 | **One-and-done retention.** Exactly *one* save offer (pause and/or lifetime discount), framed in the caller's own words and reason; on decline, execute the cancel **immediately** — never re-pitch. AIA shows Ashley making a single attempt across conv 03/04/05/06 and honoring the "no" on the next turn every time. | AIA (conv 03,04,05,06) | P1 |
+| KNOW-1 | **Product & usage guidance** (top "delight" lever). Proactively give product-specific dosing, timing, with-food notes, max dose + step-up protocol, realistic result timelines, and volunteer label safety notes. **Gap: not in mock data** — `Product` is only `sku/title/price/description/ingredients` (IFACE 3.4), so this content must live in a curated product-knowledge block in the prompt/KB, not `get_product`. | AIA (conv 01,05,11) | P1 (highest-value) |
+| EXPL-1 | **Billing/refund mechanics explanation.** Explain S&S recurring charges and net-refund / bank-posting mechanics; set concrete refund-timing expectations ("2–4 business days, sometimes up to ~10"). Ground truth comes from `transactions[]`, not improvisation. | AIA (conv 02,08) | P1 |
 | CX-1 | **Empathy sandwich** on any negative-affect turn: open with *specific, restated* empathy → info/resolution → close with empathy. "Sorry your refund hasn't arrived yet," not "sorry that happened." | Playbook Tip 1 | P0 |
 | CX-2 | **Emotion handling: mirror vs. reframe.** Match positive energy; for negative affect, stay calm, acknowledge, then reframe toward a productive frame (frustration→anticipation of resolution). Never match anger. | Emotions resource, Playbook Tip 1 | P0 |
 | CX-3 | **Verbal-Aikido cadence: yield → advance.** Acknowledge emotion first to disarm, *then* present logic/solution. Repeat the emotion→logic cycle as needed. When company at fault → lead empathy; when customer at fault → lead gentle logic, then empathize. | Resource 2, Resource 1 | P0 |
@@ -47,8 +56,9 @@ Each requirement has an ID, a source for traceability, and a priority. Sources:
 | CX-6 | **Confidence-over-speed pacing.** Do not name the caller or confirm a write instantly even when technically possible. Confirm identity before using the name; on a write, verbally look up → state what will change → execute → read back. A deliberate beat *raises* trust. | Speed/Verification resource | P0 |
 | CX-7 | **Abusive-caller boundary ladder.** Irate-but-civil → 4-step de-escalation (listen, empathize/assure, state actions, repeat). Abusive (slurs, targeted attacks, persistent profanity) → warn, re-warn, then end the call. Requires a real hangup capability (see TOOL-END). | Resource 1 | P1 |
 | TOOL-END | **End-call capability** (Twilio hangup / `<Hangup>` or clearing the Media Stream) so Ashley can terminate after the abuse ladder or a completed call. Not in the mock tool set — this is a telephony action, not a backend tool. | Resource 1 (derived), INFRA | P1 |
-| SAFE-1 | Health/adverse-reaction protocol: cancel immediately, advise medical follow-up, skip retention. | BRIEF (Ashley-in-action #2) | P0 |
+| SAFE-1 | Health/adverse-reaction protocol: cancel immediately, advise medical follow-up, skip retention. **Enum trap:** AIA conv 09 logs `medical_issue`, which is **not** a valid `cancel_subscription` reason — by voice that 400s. Map adverse-reaction cancels to `reason: "other"` (see §5 trap). | BRIEF (Ashley-in-action #2), AIA (conv 09) | P0 |
 | SAFE-2 | Guardrails against prompt-injection / out-of-scope abuse. | KICK (Chipotle example) | P1 |
+| SAFE-3 | **Health-advice guardrail** (twin of KNOW-1). When giving usage/health guidance: stay within label info, never diagnose, never exceed the stated max dose, always append a "check with your healthcare provider" note, and hard-route *any* reported adverse reaction straight to SAFE-1 (immediate cancel, no dosing advice). AIA shows Ashley volunteering safety notes (warfarin in conv 04–05, Vitamin A / pregnancy in conv 11) — replicate the instinct, gate the content. | AIA (conv 01,09,11), derived | P0 |
 | DATA-1 | Brand is **Natural Nutrition** as source of truth; reference code's real brand names / promo codes are not literal values. | README | P0 |
 | DATA-2 | Time-awareness anchored to the 2026 seed era for any "shipped X days ago" copy. | IFACE (gotcha #16) | P2 |
 | DATA-3 | Document any added mock customers/scenarios. | BRIEF (deliverable #6), README | P1 |
@@ -162,6 +172,18 @@ identity confirmation must live in the agent**, and it must gate *tools*, not ju
 **Identifiers the lookup accepts (exactly one):** `phone`, `email`, `order_number`.
 Passing two or more → `400 validation`. So: look up with one, **verify with a different one**.
 
+**Reference-system evidence (AIA).** Two AIA conversations validate this design and shape the voice adaptation:
+- **Conv 06** shows a distinct auth persona, *Iris*, that authenticates the caller (email or order number)
+  *before* handing off to Ashley for the account action ("Auth successful · records merged · hands off"). The
+  reference system treats verification as a **separate gate ahead of service**, exactly the shape of §4.
+  Voice difference: we don't have a two-bot handoff — Ashley must run both the Tier-1/2 gate *and* the service
+  in one persona, so the gate must live in orchestration state (Risk #1), not in a personality change.
+- **Conv 02 ("act first, explain second")** shows Ashley refunding + cancelling *before* replying. That works in
+  **text** because the channel is already account-authenticated (logged-in kustomerapp thread). **It does not
+  port to voice:** an inbound PSTN call is *not* authenticated, and evaluators call from unmatched numbers. Voice-Ashley
+  must **verify first, then narrate the write** (CX-6) — the opposite ordering. Document this as an explicit
+  channel-difference in DECISIONS.md: it shows *why* text-Ashley acts-first and why the voice agent deliberately doesn't.
+
 ### Tier 0 — Caller-ID (happy path, AUTH-1)
 Twilio gives the inbound `From`. Normalize to digits and `GET /customers/lookup?phone=<from>`.
 On a hit, mark the account as *located*. The brief says callers from the on-file number "don't need
@@ -224,9 +246,10 @@ game — "I'm sorry your D3 order hasn't shipped yet" beats "sorry about that." 
 words where possible (the deck's retention save does exactly this: "when you've got a supply built up…").
 
 ### Mirror vs. reframe (CX-2)
-Mirror **positive** energy (share the excitement). For **negative** energy, do **not** mirror —
-stay calm, acknowledge, and **reframe** toward a productive emotion (frustration → anticipation:
-"understandably frustrated, and — good news — about to have this sorted"). Matching anger escalates.
+Mirror **positive** energy (share the excitement) — AIA conv 11 opens with "so happy to hear you're loving it"
+and then *pivots the good mood into value* (asks the product/goal, hands over a dosage guide). For **negative**
+energy, do **not** mirror — stay calm, acknowledge, and **reframe** toward a productive emotion (frustration →
+anticipation: "understandably frustrated, and — good news — about to have this sorted"). Matching anger escalates.
 
 ### Power phrases & name usage (CX-5) — **behind a truthfulness gate**
 Deploy the caller's name mid-conversation ("I really want to get this sorted for you, Margaret"),
@@ -236,6 +259,14 @@ fabricate "I spoke with my manager" or "VIP customer" when no such thing happene
 inventing a manager is both dishonest and a demo-killer if a caller probes it. Power phrases are a
 persuasion tool, not a license to lie; every one must map to something real in the system/policy.
 
+> **Deliberate divergence from text-Ashley (DECISIONS.md-worthy).** AIA conv 03 shows text-Ashley
+> literally saying *"I spoke with my manager and I can apply a 20% discount."* Naively mirroring the
+> reference agent would import that fabrication. We keep the *truthful* half — the discount is a real
+> capability (`apply_subscription_discount`) — and drop the invented manager conversation, replacing it
+> with honest concession framing ("here's the best I can do on this: a 20% lifetime discount"). This is a
+> case where matching text-Ashley's *outcome* means **not** matching its wording. Call it out explicitly:
+> it demonstrates product judgment rather than blind mimicry.
+
 ### Confidence-over-speed pacing (CX-6) — *partially inverts the latency instinct*
 Counterintuitive but load-bearing: **instant competence reads as untrustworthy.** Three rules:
 1. **Confirm before you personalize** — don't greet "Hi Margaret!" off a caller-ID match; confirm
@@ -244,7 +275,11 @@ Counterintuitive but load-bearing: **instant competence reads as untrustworthy.*
 2. **Narrate the work on writes** — even though a mutation returns in <1s, verbally "look it up,"
    **state what will change**, execute, then **read back the result**. "Let me pull that order up…
    okay, I've got the D3, shipping to Austin — I'm going to cancel that now… done, that's cancelled,
-   no further charges."
+   no further charges." **Read back specifics, not vibes:** AIA conv 07 confirms a pause with *exact
+   dates* ("June 29 → September 29, no shipments or charges") — compute these from the 2026 anchor
+   (DATA-2). And note AIA **double-confirms even non-destructive writes**: it names the product, offers
+   a duration, then asks "shall I go ahead and place the 3-month pause now?" *before* executing. Confirm-
+   then-execute is the default for every mutation, pause included — not just for destructive ones.
 3. **A deliberate beat is a feature.** Some of the tool-call latency §3 treats as a problem to *cover*
    is, on writes, latency the customer *wants to feel*. Filler covers dead air; it should **not**
    race to make a destructive action feel instantaneous. Cover reads for speed; pace writes for trust.
@@ -285,6 +320,7 @@ Base URL `http://localhost:8001` (deployed URL in prod). All bodies JSON. Error 
 > - Discount **body** field is **`discount_pct`**; the Subscription **response** field is `discount_percentage`. Don't cross them.
 > - `refund_percentage` must be one of **`[10, 20, 25, 30, 35, 40, 50, 60]`**; 100% → `/orders/refund/full`.
 > - Address bodies have **no `name`/`phone`** — those are preserved server-side; you can't change recipient name.
+> - **Adverse-reaction cancels use `reason: "other"`.** AIA conv 09 shows text-Ashley logging `medical_issue`, but that value is **not** in the `CANCELLATION_REASONS` enum — passing it 400s. There is no health/medical reason code; the closest valid value is `other`. (Same class of trap as the ones above: the showcase reflects an idealized log, not the mock's actual contract.)
 
 ### Reads
 
@@ -393,10 +429,25 @@ Returns `{ "transcript_id", "saved": true }`; also appends one JSON line to `tra
 - Persist transcripts to file/`save_transcript` beyond console logging; wire Twilio Recording for call audio. → OBS-1, OBS-2
 - Structured tool-layer scaffolding in the bridge (httpx client keyed on `MOCK_BACKEND_URL`, session-state dict with `verified`/`candidate_account`). The Day 2 startup probe is disposable placeholder code; Day 3 replaces it with the real client.
 
-### Day 3 — Wed Jul 1 · Tool layer (P0 reads + core mutations)
-- Implement and unit-test against the mock: `customer_lookup`, `get_customer_orders`, `get_customer_subscriptions`, cancel/pause/discount sub, partial/full refund. → TOOL-1,2,3,5,6,8,10,11
-- Bake in the naming traps (`order_id` in body, `discount_pct` vs `discount_percentage`, allowed refund pcts). → TOOL-* correctness
-- Wire `TOOL-ERR`: bounded retry w/ backoff on `503`, typed error → spoken-safe messaging; never improvise an outcome. → TOOL-ERR, SAFE-1 adjacency
+### Day 3 — Wed Jul 1 · Tool layer (P0 reads + core mutations) — **DONE**
+
+**Part 1 (refactor):** single `main.py` → `app/` package (`main.py`, `bridge.py`, `session.py`, `config.py`, `tools/{client,definitions,handlers}.py`). Shared `httpx.AsyncClient` lifespan-managed. Session dict declares Day-4 auth placeholders (unused). `active_response` guard eliminates the Day-2 `response_cancel_not_active` spam.
+
+**Part 2 (P0 tool layer):**
+- All 10 P0 tools wired: `customer_lookup`, `get_customer_orders`, `get_customer_subscriptions`, `cancel_subscription`, `pause_subscription`, `apply_subscription_discount`, `partial_order_refund`, `full_order_refund`, `create_escalation`, `save_transcript`. → TOOL-1,2,3,5,6,8,10,11,14,15
+- **Naming traps encoded in schema + handler:** `order_id` in body (GID prefix validated), `discount_pct` (request) vs `discount_percentage` (response), `refund_percentage ∈ [10,20,25,30,35,40,50,60]`, `cancel_subscription.reason` enum-locked (no `medical_issue` — see Risk #16). → TOOL-* correctness, SAFE-1
+- **`TOOL-ERR` wired** in `app.tools.client.call_mock`: bounded retry (3 attempts total: initial + 200ms + 400ms backoff) on 503 + transient network errors. 400/404/409 fail immediately (contract errors — retry can't help). Terminal failure raises typed `ToolError`; handlers convert to `{ok: false, error: {code, message}}` so the model never improvises. Proven via `?force_error=true` smoke test: 3560ms elapsed, terminates with `code='forced_error' status=503`. → TOOL-ERR
+- **Discount once-per-intent guard** in `apply_subscription_discount`: session tracks `applied_discounts: set[int]`; a second call on the same subscription in the same call is rejected at the handler with `code='already_applied'` — model literally cannot compound the discount via retry or re-pitch. → Risk #2, Risk #18, RETN-2
+- **Full-refund side-effect surfaced:** when `cancelled_at` is set on the returned order (unfulfilled path), handler adds `also_cancelled: true` + `_note` so the model tells the caller both effects. → Risk #3, TOOL-11
+- **`response.function_call_arguments.done` dispatch loop** in `bridge.py`: parses args → `handlers.dispatch(name, args, session)` → `conversation.item.create` (function_call_output) → `response.create` to trigger continuation. `TODO Day 6: filler` marker in place for the deterministic dead-air cover. → tools/dispatch plumbing
+- **Handler smoketest** (`scripts/test_tools.py`): 10 tools + retry-exhaustion + local reject of `medical_issue` + discount guard, all passing against the local mock. Idempotent thanks to `POST /admin/reset` at the start.
+
+**Deferred (per scope):**
+- P1 tools (TOOL-4/7/9/12/13) — Day 6.
+- TOOL-END (Twilio hangup) — Day 5.
+- Auth state machine — Day 4 (session placeholders exist but unused).
+- Product knowledge, health guardrail, CX prompt content — Day 5.
+- Filler on tool dispatch — Day 6 (marker in place).
 
 ### Day 4 — Thu Jul 2 · Auth/verification state machine
 - Tier 0 caller-ID lookup from Twilio `From`; Tier 1 fallback (order #/email); Tier 2 challenge against real fields; gate all mutations + data disclosure behind `verified`. → AUTH-1,2,3
@@ -405,7 +456,9 @@ Returns `{ "transcript_id", "saved": true }`; also appends one JSON line to `tra
 
 ### Day 5 — Fri Jul 3 · Prompt-for-voice + **CX behavior spec baked into the prompt** + P0 side-effect tools + TOOL-END
 - Adapt `variant_a` for voice: strip markdown/bullets, keep persona, retention sequence, escalation rules; short turns. → CONV-4, RETN-1, DATA-1 (Natural Nutrition substituted throughout)
-- **Encode the CX layer directly in the prompt (not Day-9):** empathy-sandwich structure on negative turns, yield→advance cadence, mirror-vs-reframe rule, cue-to-switch heuristic, power-phrase list *with the truthfulness gate*, and the confirm-before-name / narrate-the-write pacing rules. → CX-1,2,3,4,5,6
+- **Encode the CX layer directly in the prompt (not Day-9):** empathy-sandwich structure on negative turns, yield→advance cadence, mirror-vs-reframe rule, cue-to-switch heuristic, power-phrase list *with the truthfulness gate* (and the deliberate no-fake-manager divergence from AIA conv 03), and the confirm-before-name / narrate-the-write pacing rules. Seed with real AIA own-words examples ("wanting better energy", "hanging over your head"). → CX-1,2,3,4,5,6
+- **Retention micro-sequence (RETN-1/2), from AIA:** capture reason → *one* offer (pause with duration choice + discount preserved, or a lifetime discount if the reason is cost) framed in the caller's words → light urgency on the lifetime discount ("only while the sub is active") → on decline, cancel immediately, log the reason code, and recap. Exactly one attempt — no re-pitch. → RETN-1, RETN-2
+- **Curated product-knowledge block (KNOW-1) + health-advice guardrail (SAFE-3).** The mock `Product` has no dosing/safety fields, so author a small per-SKU knowledge block (dose, timing/with-food, max dose + step-up, result timeline, label safety note) for the 5 seeded SKUs, straight from AIA conv 01/11. Gate it: stay within label info, never diagnose, never exceed max dose, always append "check with your healthcare provider," and hard-route any reported reaction to the SAFE-1 immediate-cancel branch (reason `other`). → KNOW-1, SAFE-3, SAFE-1
 - Write per-`response` `instructions` presets for emotional register (warmer/slower on health + upset turns) since Realtime has no emotion tags. → CX-2, Risk #9
 - P0 side-effect tools: escalation, transcript. → TOOL-14, TOOL-15
 - **TOOL-END wiring:** implement the Twilio hangup path (TwiML `<Hangup>` via a call-update, or terminating the Media Stream from the orchestrator) so the state machine can actually end an abusive call. Small addition next to the prompt work, but *without it the CX-7 abuse ladder has no teeth* — it's a no-op the model will just talk around. → TOOL-END, CX-7
@@ -431,6 +484,12 @@ Returns `{ "transcript_id", "saved": true }`; also appends one JSON line to `tra
 - **Write-pacing check:** confirm Ashley narrates + reads back on mutations rather than firing them instantly. → CX-6
 - Failure modes: unknown customer, tool error mid-action, caller silence. → TOOL-ERR
 - Prompt-injection / out-of-scope guardrails. → SAFE-2
+- **AIA-derived scenarios (drive the actual showcase behaviors):**
+  - *Product/usage question* ("how do I take the D3?", "how much CLEARSKIN can I take?") → correct dose + safety note + "check with your provider"; verify it does **not** invent facts absent from the knowledge block. → KNOW-1, SAFE-3
+  - *One-and-done retention* → confirm exactly one save offer and an immediate clean cancel on the first "no"; watch for the double-pitch anti-pattern and the discount-recompute footgun (Risk #2). → RETN-2
+  - *Billing-mechanics explainer* → "I was refunded less than I expected" / "I got charged again" → net-refund + S&S explanation with 2–4-day (up to ~10) timing, grounded in `transactions[]`. → EXPL-1
+  - *Adverse reaction* → immediate cancel with reason **`other`** (not `medical_issue`), zero retention, medical follow-up. → SAFE-1
+  - *Exact-date pause readback* anchored to the 2026 seed era. → CX-6, DATA-2
 
 ### Day 9 — Thu Jul 9 · Conversation-quality **tuning** *(behaviors already built Day 5/8 — this is calibration, not first-introduction)*
 - Tune prosody, turn length, interruption feel, filler naturalness; remove any "AI slop" phrasing. → VOICE-1, CONV-1/2/4
@@ -440,7 +499,7 @@ Returns `{ "transcript_id", "saved": true }`; also appends one JSON line to `tra
 - Add + document any extra mock scenarios/customers. → DATA-3
 
 ### Day 10 — Fri Jul 10 · Deliverables
-- `DECISIONS.md` — **self-written**: Path 1 vs Path 3 tradeoff, what was cut, prompt-for-voice adaptation, latency math (§3), auth design, **the CX/emotional-handling model (§4.5) and its read-vs-write pacing split**, retro. → DOC-1
+- `DECISIONS.md` — **self-written**: Path 1 vs Path 3 tradeoff, what was cut, prompt-for-voice adaptation, latency math (§3), auth design, **the CX/emotional-handling model (§4.5) and its read-vs-write pacing split**, **where voice-Ashley deliberately diverges from text-Ashley** (no fabricated manager per AIA conv 03; verify-then-act instead of text's act-first-explain-second per AIA conv 02; product knowledge sourced from a curated block since the mock `Product` has none), retro. → DOC-1
 - `README`/`TESTING.md`: run steps, keys, point a Twilio number, recommended scenarios, known limits. → DOC-2
 - Record the 5-min Loom: 2–3 scenarios end-to-end + stack rationale. → DOC-3
 
@@ -465,3 +524,7 @@ Returns `{ "transcript_id", "saved": true }`; also appends one JSON line to `tra
 12. **Abuse ladder needs a real hangup and state, not vibes.** Ending a call requires TOOL-END (Twilio hangup), and strike-counting must live in orchestration state or the model will forgive-and-forget mid-call. Also: barge-in tuning must not clip a *venting-but-civil* caller, or the 4-step de-escalation breaks at step 1 (listen). (CX-7, TOOL-END, CONV-1)
 13. **Realtime GA schema ≠ beta schema.** The OpenAI Realtime GA (`gpt-realtime`) uses `session.type: "realtime"`, nested `audio.input.*` / `audio.output.*` config, format as `{"type": "audio/pcmu"}` (not the flat string `"g711_ulaw"`), renamed server events (`response.output_audio.delta`, `response.output_audio_transcript.done`, `response.output_audio.done`), `output_modalities` instead of `modalities`, no `temperature` at the session level, and **no `OpenAI-Beta: realtime=v1` header**. Most tutorials and the older Twilio-Realtime samples still show the beta schema. Reverting any of these — or copy-pasting an older example — silently closes the socket ~2s in with no error surfaced to the client. Already hit and fixed on Day 1; do not regress when adding tool definitions or refactoring `session.update`. (INFRA-1, VOICE-1)
 14. **VAD is not noise-robust out of the box.** Day 2's first live call happened during heavy rain and the `server_vad` fired `speech_started` repeatedly on non-speech, driving a cut-off-and-re-greet loop. Evaluators (including Rico's cold-call role-plays) won't always be in quiet rooms — a café, a car, a windy sidewalk are all realistic. **The noise case is the useful stress test:** if barge-in behaves under noise, it behaves anywhere; if it only behaves in a quiet room, it fails the demo in the wrong place. Compounds with Risk #12 / CX-7 — tuning must not clip a venting-but-civil caller. Fix path: quiet-room retest first (isolate noise from threshold), then tune `threshold` / `silence_duration_ms`, or switch to `semantic_vad`. Also fix the unconditional `response.cancel` on every `speech_started` (Day 6 addendum): guard with an `active_response` flag so we don't spam `response_cancel_not_active`. (CONV-1, CX-7)
+15. **Product-guidance delight has no data source — and is a liability surface.** AIA's most "delightful" moments (D3+K2, Magnesium, CLEARSKIN dosing) are detailed usage/safety advice, but the mock `Product` carries only `sku/title/price/description/ingredients` (IFACE 3.4) — no dose, max dose, timing, or safety fields. So this can't come from `get_product`; it needs a curated per-SKU knowledge block in the prompt/KB (KNOW-1). And the moment the agent gives dosing by voice, SAFE-3 applies: label-only info, never diagnose, never exceed max dose, always defer to a provider, and any reported reaction hard-routes to the SAFE-1 immediate-cancel branch. Chasing the delight without the guardrail is how a supplement voice agent says something it shouldn't on a recorded eval call. (KNOW-1, SAFE-3)
+16. **`medical_issue` is not a valid cancel reason.** AIA conv 09 logs an adverse-reaction cancel as `medical_issue`; that value isn't in `CANCELLATION_REASONS`, so the call 400s. The showcase reflects an idealized log, not the mock's contract — map adverse-reaction cancels to `reason: "other"`. Same trap-class as the `order_id`/`discount_pct` naming traps: trust IFACE over the showcase for wire values. (SAFE-1)
+17. **Text-Ashley's stock phrasing sounds robotic by voice.** Nearly every AIA thread closes with the identical line "If you have any order questions, I'm here to help anytime!" and opens with "Thank you for reaching out to us,". Fine in an async text thread; by voice, a verbatim repeated opener/closer is exactly the "AI slop" Ryan warned against (VOICE-1, CONV-4). Mirror text-Ashley's *warmth and structure*, not its boilerplate strings — vary the close and keep it short.
+18. **Retention can tip into nagging.** AIA's discipline is *one* save offer, then honor the "no" (RETN-2). A voice model under a "retain the customer" instruction tends to re-pitch after a decline, which (a) reads as pushy on a recorded call and (b) risks re-calling `apply_subscription_discount` and compounding the discount (Risk #2). Cap save attempts at one per intent (orchestration or prompt), and treat the first clear "no" as the cue-to-switch (CX-4) into clean execution. (RETN-2, CX-4, TOOL-8)

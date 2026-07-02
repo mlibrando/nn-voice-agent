@@ -7,6 +7,8 @@ import os
 
 from dotenv import load_dotenv
 
+from app.tools.definitions import TOOL_DEFINITIONS
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -67,6 +69,11 @@ SESSION_UPDATE_PAYLOAD = {
                 "voice": VOICE,
             },
         },
+        # Function-calling: expose the P0 tool set + let the model choose when
+        # to use them. Schemas + handlers live in app.tools. `tool_choice: auto`
+        # is important — `required` would force a tool call every turn.
+        "tools": TOOL_DEFINITIONS,
+        "tool_choice": "auto",
     },
 }
 

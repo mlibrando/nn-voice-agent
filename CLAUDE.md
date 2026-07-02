@@ -124,9 +124,12 @@ With Realtime, conversational turns (no tool) are ~0.5–0.8s — under the ~1s 
 - ✅ **Mock backend deployed and co-located: Fly.io app `nn-mock-backend`, `iad`, private-only (no public IPs). Bridge reaches it over 6PN at `http://nn-mock-backend.internal:8001` via `MOCK_BACKEND_URL` env var. Chaos defaults (300–1500ms + 1200ms on `/subscriptions` + 7% 503s) intentionally left on — that's the contract, not a bug.**
 - ✅ **INFRA-2 satisfied — full system is cold-callable without my laptop.** Bridge startup probe against the mock passes: `Mock backend reachable at http://nn-mock-backend.internal:8001/health — 200 {"ok":true}`.
 - ⬜ Audio recording (OBS-1) + persisted transcripts (OBS-2) beyond console logging
-- ⬜ Tool layer not yet wired (Day 3 — will use `MOCK_BACKEND_URL` as base URL for the httpx tool client)
-- ⬜ Auth state machine not yet implemented (Day 4)
-- ⬜ Bridge/main.py module refactor into structured layers (Day 3 alongside the tool client)
+- ✅ **Bridge module refactor complete (Day 3 part 1)** — `app/{main,bridge,session,config,tools/{client,definitions,handlers}}.py`
+- ✅ **P0 tool layer complete (Day 3 part 2)** — 10 tools wired (TOOL-1,2,3,5,6,8,10,11,14,15) against the shared httpx client. `TOOL-ERR` bounded-retry (3 attempts, 200/400ms backoff on 503+network). Discount once-per-intent guard blocks compounding. Full-refund side-effect surfaced via `also_cancelled`. `medical_issue` rejected at handler before it reaches the mock. Realtime function-call dispatch loop live in `bridge.py`.
+- ⬜ Auth state machine (Day 4) — session placeholders `verified`/`customer`/`candidate_account` declared, unused
+- ⬜ P1 tools TOOL-4/7/9/12/13 (Day 6), TOOL-END (Day 5)
+- ⬜ Filler on tool dispatch (Day 6 — `TODO Day 6` marker in `bridge.py`)
+- ⬜ CX prompt content, product knowledge block, health guardrail (Day 5)
 
 ## Known issues / observations (from Day 2 live test call + deploy)
 - **False barge-ins under background noise.** In a live test taken during heavy rain, the VAD fired `Barge-in detected` repeatedly on non-speech, causing the agent to cut itself off mid-word and re-greet in a loop. Root cause not yet confirmed — could be environmental noise (rain, HVAC), the mic sensitivity of the caller's phone, or the `threshold: 0.5` being too permissive. **Needs a quiet-room retest before tuning** so we don't overfit the threshold to one bad recording. Current VAD settings in `main.py`: `threshold: 0.5`, `prefix_padding_ms: 300`, `silence_duration_ms: 500`. Tuning tracked to Day 6/9.
@@ -146,8 +149,11 @@ nn-voice-agent/                      # bridge (this repo), Fly app: nn-voice-age
 │   ├── config.py                    # Env vars, VOICE, system prompt, SESSION_UPDATE_PAYLOAD, LOG_EVENTS
 │   └── tools/
 │       ├── __init__.py
-│       ├── client.py                # Shared httpx.AsyncClient pointed at MOCK_BACKEND_URL + health_probe()
-│       └── definitions.py           # placeholder — Realtime tool schemas land in Day 3 part 2
+│       ├── client.py                # Shared httpx.AsyncClient + call_mock retry/backoff + ToolError + health_probe
+│       ├── definitions.py           # OpenAI Realtime tool schemas (P0 × 10) + enum constants
+│       └── handlers.py              # Async handler per tool + dispatch(); once-per-intent guards; medical_issue reject
+├── scripts/
+│   └── test_tools.py                # Dev-time smoke test: all 10 handlers + retry exhaustion + guards. Resets mock at start.
 ├── requirements.txt                 # fastapi, uvicorn, websockets, httpx, dotenv, certifi
 ├── Dockerfile                       # single-stage python:3.13-slim, uvicorn app.main:app on 0.0.0.0:${PORT} (8080)
 ├── .dockerignore                    # excludes .env, .venv, __pycache__, .git, docs
