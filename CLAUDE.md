@@ -5,6 +5,12 @@ Building a customer support **voice agent** ("Ashley") for Natural Nutrition, a 
 
 The agent mirrors an existing text-based support agent ("text-Ashley") but adapted for voice — short turns, conversational pacing, no markdown/bullets.
 
+## About me / working preferences
+- **Background:** senior full-stack engineer. Strong Python/FastAPI, TypeScript, React, NestJS.
+- **When planning:** structured plans with explicit P0/P1/P2 priorities and honest trade-offs — show what's cut and why.
+- **When implementing:** production-quality code with real error handling. Flag risks and edge cases proactively; don't wait to be asked.
+- **When I correct a recommendation:** incorporate it cleanly and move forward. Don't re-litigate settled choices.
+
 ## Architecture (Path 1 — locked in)
 **Twilio Programmable Voice + OpenAI Realtime API (speech-to-speech).**
 
@@ -112,28 +118,34 @@ With Realtime, conversational turns (no tool) are ~0.5–0.8s — under the ~1s 
 - **Full refund side effect:** Silently cancels unfulfilled orders — surface both effects to caller
 - **Cancel-order 409:** Don't promise cancel before checking fulfillment_status; fall back to refund
 
-## Current state (as of end of Day 2 — fully self-standing on Fly)
-- ✅ Twilio ↔ OpenAI Realtime bridge working end-to-end
-- ✅ GA schema (nested audio config, updated event names)
-- ✅ Caller can hear agent, have a conversation
-- ✅ Transcript capture (input + output) logging to console
-- ✅ Barge-in works on quiet-room calls (noise case still open — see Known issues)
+## Current state (as of end of Day 3 — tool layer live, barge-in truly working)
+### Days 1–2 (infra + bridge)
+- ✅ Twilio ↔ OpenAI Realtime bridge, GA schema (nested audio config, correct event names)
 - ✅ Bridge deployed: Fly.io app `nn-voice-agent`, `iad`, single-stage Dockerfile, no scale-to-zero, 2 machines warm
-- ✅ Twilio number repointed from ngrok → deployed `https://nn-voice-agent.fly.dev/incoming-call`
-- ✅ Real-phone RTT baseline captured on deployed `iad` host — conversational (no-tool) turns ~0.4–2.0s, matching PLAN §3 estimate
-- ✅ **Mock backend deployed and co-located: Fly.io app `nn-mock-backend`, `iad`, private-only (no public IPs). Bridge reaches it over 6PN at `http://nn-mock-backend.internal:8001` via `MOCK_BACKEND_URL` env var. Chaos defaults (300–1500ms + 1200ms on `/subscriptions` + 7% 503s) intentionally left on — that's the contract, not a bug.**
-- ✅ **INFRA-2 satisfied — full system is cold-callable without my laptop.** Bridge startup probe against the mock passes: `Mock backend reachable at http://nn-mock-backend.internal:8001/health — 200 {"ok":true}`.
+- ✅ Twilio number pointed at `https://nn-voice-agent.fly.dev/incoming-call`
+- ✅ Real-phone RTT baseline on deployed `iad` — ~0.4–2.0s conversational turns, matches §3 estimate
+- ✅ Mock backend co-located on Fly (`nn-mock-backend`, `iad`), private-only via 6PN at `http://nn-mock-backend.internal:8001` (`MOCK_BACKEND_URL` secret). Chaos defaults on (300–1500ms + 1200ms on `/subscriptions` + 7% 503s — the contract, not a bug).
+- ✅ **INFRA-2 satisfied** — cold-callable without my laptop; bridge startup probe against mock passes
+- ✅ Transcript capture (input + output) logging to console
+
+### Day 3 (tool layer + interaction fixes) — closed
+- ✅ **Bridge module refactor** — `app/{main,bridge,session,config,tools/{client,definitions,handlers}}.py`
+- ✅ **P0 tool layer** — 10 tools wired (TOOL-1,2,3,5,6,8,10,11,14,15) with naming traps baked into schemas + handler defenses
+- ✅ **TOOL-ERR retry/backoff** — 3 attempts, 200/400ms backoff on 503 + transient network; 4xx fails immediately
+- ✅ **Discount lifecycle guarded end-to-end** — within-call (`session.applied_discounts`) blocks re-pitch compounding; cross-call reads persisted `discount_percentage` from `session.subscriptions_by_id` (populated by `customer_lookup`) so a returning caller can't stack. Policy drafted in `DECISIONS.md`.
+- ✅ **Escalation degrades without customer_id** — unauth path prepends `[unverified caller — call_sid=…]` to `customer_details` as ops correlation key
+- ✅ **A1 proactive greeting** (live-verified) — Ashley greets on pickup unprompted; no more "she waits until I say something"
+- ✅ **A2 barge-in during Twilio playback** (live-verified — real CONV-1 fix) — replaced the broken `active_response` scheme with item-id-keyed anchor + Twilio-timestamp elapsed + `audio_sent_ms` clamp. Six consecutive interrupts in one call: `won=elapsed` every time (clamp is a no-op), no `invalid_value` errors, offsets plausibly per-response (760ms – 7400ms based on how long she was allowed to speak). Supersedes the earlier "acceptable for telephony" state — the truncate now keeps OpenAI's item in sync with what the caller actually heard.
+
+### Pending / next
+- ⬜ **Day 4 — auth state machine.** Session placeholders `verified`/`customer`/`candidate_account` declared, unused. `subscriptions_by_id` cache and the `create_escalation` unauth fallback are both waiting to be consumed by real auth (post-auth, `customer_lookup` populates the cache implicitly; `create_escalation` also gains the Twilio `From` number to attach to `customer_details`).
+- ⬜ **Day 5** — CX prompt content, product-knowledge block (KNOW-1), health guardrail (SAFE-3), TOOL-END (Twilio hangup for CX-7)
+- ⬜ **Day 6** — deterministic filler on tool dispatch (`TODO Day 6` marker in `bridge.py`), P1 tools TOOL-4/7/9/12/13, VAD tuning after quiet-room retest
+- ⬜ **Day 7** — call-review UI (bridge-side persistence per Day-2 known-issues note)
 - ⬜ Audio recording (OBS-1) + persisted transcripts (OBS-2) beyond console logging
-- ✅ **Bridge module refactor complete (Day 3 part 1)** — `app/{main,bridge,session,config,tools/{client,definitions,handlers}}.py`
-- ✅ **P0 tool layer complete (Day 3 part 2)** — 10 tools wired (TOOL-1,2,3,5,6,8,10,11,14,15) against the shared httpx client. `TOOL-ERR` bounded-retry (3 attempts, 200/400ms backoff on 503+network). Discount once-per-intent guard blocks compounding. Full-refund side-effect surfaced via `also_cancelled`. `medical_issue` rejected at handler before it reaches the mock. Realtime function-call dispatch loop live in `bridge.py`.
-- ⬜ Auth state machine (Day 4) — session placeholders `verified`/`customer`/`candidate_account` declared, unused
-- ⬜ P1 tools TOOL-4/7/9/12/13 (Day 6), TOOL-END (Day 5)
-- ⬜ Filler on tool dispatch (Day 6 — `TODO Day 6` marker in `bridge.py`)
-- ⬜ CX prompt content, product knowledge block, health guardrail (Day 5)
 
 ## Known issues / observations (from Day 2 live test call + deploy)
-- **False barge-ins under background noise.** In a live test taken during heavy rain, the VAD fired `Barge-in detected` repeatedly on non-speech, causing the agent to cut itself off mid-word and re-greet in a loop. Root cause not yet confirmed — could be environmental noise (rain, HVAC), the mic sensitivity of the caller's phone, or the `threshold: 0.5` being too permissive. **Needs a quiet-room retest before tuning** so we don't overfit the threshold to one bad recording. Current VAD settings in `main.py`: `threshold: 0.5`, `prefix_padding_ms: 300`, `silence_duration_ms: 500`. Tuning tracked to Day 6/9.
-- **`response_cancel_not_active` error spam.** Every `speech_started` sends `response.cancel` unconditionally, even when there's no in-flight response. OpenAI returns `response_cancel_not_active` every time, filling the logs with noise. This is a code bug independent of the noise question. **Fix (deferred to Day 6/9 with the VAD tuning):** track an `active_response` flag in the session dict — set on `response.created`, cleared on `response.done` / `response.output_audio.done` — and only emit `response.cancel` when it's true. Same logic should also gate the `clear` message sent to Twilio.
+- **VAD noise-robustness still untested.** The old `response.cancel` cut-off-and-re-greet loop from the rainy-day test is architecturally resolved by A2 (mark-queue gate + item-id truncate). The remaining open question is whether `server_vad @ threshold: 0.5` fires false `speech_started` events on background noise (rain, café, car, HVAC). Under the new bridge a false trigger during Ashley's playback would still truncate her mid-sentence (bad UX, but no runaway loop). Quiet-room baseline first, then Day 6/9 tuning of `threshold` / `silence_duration_ms` or a switch to `semantic_vad`. Current VAD settings in `app/config.py`: `threshold: 0.5`, `prefix_padding_ms: 300`, `silence_duration_ms: 500`.
 - **Conversational latency baseline is healthy.** No-tool turns measured **~0.4–2.0s** from `speech_stopped` to `response.output_audio.done` on the deployed `iad` host. That's consistent with the PLAN §3 estimate (~0.5–0.8s typical, worst case ~0.8s pre-network) plus real-world telephony jitter — under the ~1s perceived bar in the common case. **Filler is not needed on conversational turns.** The dead-air problem will only materialize once the tool layer adds the mock's injected 300–1500ms per call (and +1200ms on `/subscriptions`); re-measure then and confirm the §3 filler trigger is still the right cover.
 - **Mock backend state is ephemeral — never redeploy right before a demo.** `store.py` holds all state in memory, seeded from `seed_data.json` on boot. Any redeploy (or Fly machine restart, however triggered) wipes mutation state back to seed. If an evaluator has been mid-call editing subs/orders, their world will reset. **Rule of thumb:** don't `fly deploy` the mock in the 30 min before a scheduled evaluator/demo window. If you MUST push a mock fix right before a call, understand you're resetting the caller's account state too.
 - **OBS-2 (transcript persistence) must not depend on the mock's `transcripts.log`.** The mock appends every `POST /transcripts` to a local `transcripts.log` file next to `app.py` on the container's overlay FS — that file vanishes on any machine restart (see above). **Production transcript path is the bridge-side call store** (Day 7 UI reads from there, not from the mock's log). The mock's `save_transcript` endpoint stays useful for the *demo contract* (proving the tool works), but the durable source-of-truth is bridge-owned. This shapes the Day 7 call-review UI design: it reads bridge-side persistence, not the mock, and the mock's `transcripts.log` is diagnostic-only.
@@ -144,7 +156,7 @@ nn-voice-agent/                      # bridge (this repo), Fly app: nn-voice-age
 ├── app/                             # (Day 3 part 1 refactor — was single main.py)
 │   ├── __init__.py                  # logging setup
 │   ├── main.py                      # FastAPI app: routes + lifespan (health probe, tool-client startup/shutdown)
-│   ├── bridge.py                    # Twilio ↔ OpenAI WebSocket bridge + barge-in (with active_response guard)
+│   ├── bridge.py                    # Twilio ↔ OpenAI WebSocket bridge + item-id-keyed truncate barge-in
 │   ├── session.py                   # Per-call state factory (incl. Day-4 auth placeholders: verified/customer/candidate_account)
 │   ├── config.py                    # Env vars, VOICE, system prompt, SESSION_UPDATE_PAYLOAD, LOG_EVENTS
 │   └── tools/

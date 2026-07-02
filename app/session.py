@@ -18,10 +18,43 @@ def new_session() -> dict:
         # Transcripts (in = caller, out = agent)
         "transcript_in": [],
         "transcript_out": [],
-        # OpenAI response tracking — True while a response is being generated.
-        # Gates barge-in's `response.cancel` + Twilio `clear` so we don't emit
-        # `response_cancel_not_active` errors when nothing's in flight.
-        "active_response": False,
+        # ─── Barge-in / playback tracking (Twilio Realtime idiom) ───
+        # OpenAI's `response.done` fires when generation completes, but Twilio
+        # keeps *playing* buffered audio for another 1–3s. So "response
+        # in-flight" and "audio in-flight to caller" are different questions,
+        # and only the second one matters for barge-in. We track playback state
+        # using Twilio's own audio clock:
+        #
+        #   `latest_media_timestamp` — Twilio's stream position, updated on
+        #     every incoming `media` event. Monotonic, ~real-time.
+        #   `response_start_timestamp_twilio` — value of the above at the
+        #     moment we sent the first audio delta of the CURRENT assistant
+        #     item (keyed on `last_assistant_item`). Re-anchored whenever a
+        #     new `item_id` appears — critically, this means the anchor is
+        #     fresh at every new response's first delta, not just after a
+        #     barge-in. The earlier "reset only on barge-in" scheme let the
+        #     anchor go stale across normal turn completions and produced
+        #     wildly over-estimated `audio_end_ms` on later barge-ins.
+        #   `last_assistant_item` — item_id of the current assistant audio
+        #     item, needed for `conversation.item.truncate` and for gating
+        #     the anchor re-set.
+        #   `audio_sent_ms` — cumulative ms of audio we've forwarded to
+        #     Twilio for the current item. Used as a safety-net clamp on
+        #     `audio_end_ms` so a bogus anchor can never make us ask OpenAI
+        #     to truncate past the audio we actually generated.
+        #   `mark_queue` — Twilio marks we've sent that haven't been echoed
+        #     back yet. Non-empty ⇔ audio is buffered/playing on Twilio.
+        #     This is the barge-in gate: empty queue means nothing to cancel.
+        #
+        # On `input_audio_buffer.speech_started`, if `mark_queue` is non-empty:
+        #   audio_end_ms = max(0, min(latest - anchor, audio_sent_ms))
+        #   send `conversation.item.truncate` at that offset, plus a Twilio
+        #   `clear` to drain the buffer.
+        "latest_media_timestamp": 0,
+        "response_start_timestamp_twilio": None,
+        "last_assistant_item": None,
+        "audio_sent_ms": 0.0,
+        "mark_queue": [],
         # Destructive-tool guard — subscription_ids where
         # `apply_subscription_discount` already ran. Blocks the re-pitch/retry
         # compounding case at the handler level. See Risk #2/#18 and
