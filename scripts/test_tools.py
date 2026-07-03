@@ -718,6 +718,161 @@ async def main() -> int:
         else:
             print("  ✓ caller_id_confirm refused when tier0_hit=False (invariant holds)")
 
+        print()
+        print("── AUTH-17 THE F8-live regression guard: 'This is Bob' MUST fail ──")
+        # Day 5 coupled fix: open Tier-0 greeting invites "This is <name>"
+        # answers. Old `_is_affirmative` matched "this is" as a substring, so
+        # ANY name claim verified. AUTH-17 is the ship-block: if this ever
+        # passes with verified=True, the bypass is back.
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-17"
+        s["call_sid"] = "CA-AUTH-17"
+        s["from_number"] = "+15125550101"  # Margaret's phone
+        _ = await h.customer_lookup({"phone": "+15125550101"}, s)
+        assert s.get("tier0_hit"), "test setup: tier0_hit should be True"
+
+        r = await h.verify_identity(
+            {"challenge_kind": "caller_id_confirm", "given_value": "This is Bob"}, s,
+        )
+        _print("verify_identity(caller_id_confirm, 'This is Bob') on Tier-0 Margaret", r)
+        if r.get("ok") or s.get("verified"):
+            failures += 1
+            print("  ✗ HARD FAIL — AUTH-17 REGRESSION: impostor 'This is Bob' verified as Margaret. The F8-live bypass is back. Investigate _is_affirmative in app/tools/handlers.py.")
+        elif r.get("error", {}).get("code") != "verification_failed":
+            failures += 1
+            print(f"  FAIL: expected code=verification_failed, got {r.get('error', {}).get('code')!r}")
+        elif r.get("attempts_remaining") != 2:
+            failures += 1
+            print(f"  FAIL: attempts_remaining should be 2, got {r.get('attempts_remaining')}")
+        else:
+            print("  ✓ impostor rejected; attempts_remaining=2; verified stays False")
+
+        print()
+        print("── AUTH-18 correct name in claim: 'This is Margaret' verifies ──")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-18"
+        s["call_sid"] = "CA-AUTH-18"
+        s["from_number"] = "+15125550101"
+        _ = await h.customer_lookup({"phone": "+15125550101"}, s)
+        r = await h.verify_identity(
+            {"challenge_kind": "caller_id_confirm", "given_value": "This is Margaret"}, s,
+        )
+        _print("verify_identity(caller_id_confirm, 'This is Margaret')", r)
+        if not r.get("ok") or not r.get("verified"):
+            failures += 1
+            print("  FAIL: correct name claim should verify")
+
+        print()
+        print("── AUTH-19 bare 'yes' still works ──")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-19"
+        s["call_sid"] = "CA-AUTH-19"
+        s["from_number"] = "+15125550101"
+        _ = await h.customer_lookup({"phone": "+15125550101"}, s)
+        r = await h.verify_identity(
+            {"challenge_kind": "caller_id_confirm", "given_value": "yes"}, s,
+        )
+        if not r.get("ok") or not r.get("verified"):
+            failures += 1
+            print("  FAIL: bare 'yes' should verify")
+        else:
+            print("  ✓ bare 'yes' still verifies")
+
+        print()
+        print("── AUTH-20 bare-name answer: 'Margaret' verifies ──")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-20"
+        s["call_sid"] = "CA-AUTH-20"
+        s["from_number"] = "+15125550101"
+        _ = await h.customer_lookup({"phone": "+15125550101"}, s)
+        r = await h.verify_identity(
+            {"challenge_kind": "caller_id_confirm", "given_value": "Margaret"}, s,
+        )
+        if not r.get("ok") or not r.get("verified"):
+            failures += 1
+            print("  FAIL: bare correct name should verify")
+        else:
+            print("  ✓ bare correct name verifies (open-greeting response format)")
+
+        print()
+        print("── AUTH-21 mixed affirmative + wrong name: 'Yeah, Bob' fails ──")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-21"
+        s["call_sid"] = "CA-AUTH-21"
+        s["from_number"] = "+15125550101"
+        _ = await h.customer_lookup({"phone": "+15125550101"}, s)
+        r = await h.verify_identity(
+            {"challenge_kind": "caller_id_confirm", "given_value": "Yeah, Bob"}, s,
+        )
+        _print("verify_identity(caller_id_confirm, 'Yeah, Bob')", r)
+        if r.get("ok") or s.get("verified"):
+            failures += 1
+            print("  FAIL: 'Yeah, Bob' must not verify — 'bob' isn't in the affirmative/stop sets")
+        else:
+            print("  ✓ mixed affirmative + wrong name rejected")
+
+        print()
+        print("── END-1 end_call handler shape + graceful missing-creds path ──")
+        # end_call posts to Twilio's REST API. In local test we don't have
+        # real creds; assert the handler returns a structured error rather
+        # than raising, and that its shape is right. Full live-call test is
+        # in TESTING.md G7.
+        import os as _os
+        old_sid = _os.environ.get("TWILIO_ACCOUNT_SID", "")
+        old_tok = _os.environ.get("TWILIO_AUTH_TOKEN", "")
+        # Force missing-creds path.
+        _os.environ["TWILIO_ACCOUNT_SID"] = ""
+        _os.environ["TWILIO_AUTH_TOKEN"] = ""
+        # Reload config so the handler sees the cleared vars.
+        import importlib
+        from app import config as _cfg
+        importlib.reload(_cfg)
+
+        s = new_session()
+        s["stream_sid"] = "SM-END-1"
+        s["call_sid"] = "CA-END-1"
+
+        # end_call must be in the PRE_AUTH whitelist (abuse can happen pre-verify).
+        if "end_call" not in h._PRE_AUTH_TOOLS:
+            failures += 1
+            print("  FAIL: end_call must be in _PRE_AUTH_TOOLS")
+        else:
+            print("  ✓ end_call is in _PRE_AUTH_TOOLS (abuse-before-verify path)")
+
+        r = await h.end_call({"reason": "abusive caller — ended after two warnings"}, s)
+        _print("end_call with missing Twilio creds", r)
+        if r.get("ok"):
+            failures += 1
+            print("  FAIL: end_call must not report ok=True when creds are missing")
+        elif r.get("error", {}).get("code") != "credentials_missing":
+            failures += 1
+            print(f"  FAIL: expected code=credentials_missing, got {r.get('error', {}).get('code')!r}")
+        else:
+            print("  ✓ graceful error return on missing creds (no crash, no exception)")
+
+        # abuse_strikes should have incremented (observability field).
+        if s.get("abuse_strikes", 0) != 1:
+            failures += 1
+            print(f"  FAIL: abuse_strikes should be 1 after end_call attempt, got {s.get('abuse_strikes')}")
+        else:
+            print("  ✓ abuse_strikes incremented (observability)")
+
+        # Test dispatch gate: end_call works unverified (like create_escalation).
+        s2 = new_session()
+        s2["call_sid"] = "CA-END-1B"
+        r2 = await h.dispatch("end_call", {"reason": "test"}, s2)
+        # Missing creds → returns credentials_missing, NOT verification_required.
+        if r2.get("error", {}).get("code") == "verification_required":
+            failures += 1
+            print("  FAIL: dispatch gate wrongly blocked end_call pre-verify")
+        else:
+            print("  ✓ dispatch gate allows end_call pre-verify")
+
+        # Restore env.
+        _os.environ["TWILIO_ACCOUNT_SID"] = old_sid
+        _os.environ["TWILIO_AUTH_TOKEN"] = old_tok
+        importlib.reload(_cfg)
+
     finally:
         await tools_client.shutdown()
 

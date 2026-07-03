@@ -335,4 +335,37 @@ TOOL_DEFINITIONS: list[dict] = [
             "additionalProperties": False,
         },
     },
+    # ------------------------------------------------------- TOOL-END (Day 5)
+    {
+        "type": "function",
+        "name": "end_call",
+        "description": (
+            "Terminate the phone call via Twilio. USE ONLY at the end of the "
+            "CX-7 abusive-caller ladder: after you've delivered TWO clear "
+            "warnings in-conversation about abusive language and given the "
+            "caller a chance to reset both times. Also acceptable at genuinely "
+            "completed calls where the caller has signaled goodbye and there's "
+            "nothing left to do. NEVER use end_call to duck a difficult "
+            "conversation — de-escalate first, empathize, offer resolution. "
+            "The handler auto-creates a high-risk escalation before hanging up "
+            "so ops has an audit trail. Do not call this before save_transcript "
+            "on a normal call; call save_transcript first so the record persists."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Short human-readable reason for terminating, e.g. "
+                        "'abusive caller — ended after two warnings' or "
+                        "'call complete, caller said goodbye'. Written into "
+                        "the auto-escalation for ops."
+                    ),
+                },
+            },
+            "required": ["reason"],
+            "additionalProperties": False,
+        },
+    },
 ]

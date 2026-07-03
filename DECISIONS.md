@@ -144,17 +144,24 @@ via `verify_identity`; the `caller_id_confirm` challenge still accepts the
 caller's name (matched via `_is_affirmative`) or any clear affirmation. Only
 the phrasing shifts — Ashley never volunteers the name.
 
-**Implementation note (open follow-up):** the current bridge greeting
-instructions in `app/bridge.py` still tell Ashley to greet by first name on
-Tier-0 hit. That contradicts this decision and needs to be updated as part
-of Day 5 CX prompt work. When we do, tighten `_is_affirmative` at the same
-time: today it matches any of `AFFIRMATIVE_WORDS` including "this is", so
-"This is Bob" (a wrong name) would still verify against a `first_name` of
-"Margaret". That's an existing latent bug that the open-greeting pattern
-would surface more often; the fix is to make the name-in-string branch
-authoritative and require it to actually equal the located first name when
-present, falling back to bare-affirmative words only when no name-shaped
-token is in the answer.
+**Implementation note (landed Day 5 — coupled fix).** The bridge greeting
+instructions in `app/bridge.py` now use OPEN confirmation regardless of
+Tier-0 hit ("who do I have the pleasure of speaking with?"), and never
+volunteer the located name. `_is_affirmative` in `app/tools/handlers.py`
+was tightened in the same commit: it now requires the correct located
+first name for any answer that contains a name claim (via
+`_NAME_CLAIM_PREFIXES` — "this is", "i am", "i'm", "speaking", "it's"),
+and accepts bare affirmatives ("yes", "yeah") only when the answer has no
+name-shaped token.
+
+The two changes were shipped together as a single unit because separating
+them would have opened an auth bypass window: the open greeting invites
+"This is [name]" answers, and the pre-fix `_is_affirmative` matched "this
+is" as a substring so ANY name claim verified. The regression test
+`AUTH-17` in `scripts/test_tools.py` locks this in — "This is Bob" against
+`first_name="Margaret"` must return `verification_failed`. If AUTH-17 ever
+passes with `ok=True verified=True`, the bypass is back and the deploy is
+ship-blocked.
 
 ---
 
@@ -239,6 +246,162 @@ doesn't accidentally come back as a "why not add this too?" contribution.
 order numbers off email screenshots or unboxing videos, we tighten Tier 2 to
 require `card_last_four` or an address element, and drop `order_name` as a
 challenge. Documented so we don't need to rediscover it under incident.
+
+---
+
+## The truthfulness gate — no fake manager, no invented authority
+
+> 🚧 **DRAFT — REVIEW AND REWORD** before this becomes canonical.
+
+**Decision.** Ashley never invokes an authority she doesn't have. She has
+`create_escalation` (for human follow-up) and the real discount tool
+(`apply_subscription_discount`). She does not have a manager, a supervisor,
+a VIP program, or an approvals workflow. The SYSTEM_MESSAGE forbids her from
+claiming to "check with my manager," "speak to a supervisor," or reference
+"VIP status" — all fictions in the deployed system.
+
+**What we kept.** The OUTCOME from the reference (text-)Ashley showcase.
+In AIA conv 03, text-Ashley says *"I spoke with my manager and I can apply
+a 20% discount."* The 20% discount is real (the tool is real, we ship it).
+The manager conversation is fictional. Voice-Ashley keeps the discount and
+drops the fiction, using CONCESSION FRAMING instead: *"Here's the best I
+can do — a 20% lifetime discount, and it stays as long as you keep your
+subscription active."* Same outcome to the caller, no lie.
+
+**Why this specific rule matters more by voice than by text.**
+
+1. **Probing risk.** A text conversation is a controlled surface — text-
+   Ashley can dodge follow-ups. A voice caller can ask "wait — who's your
+   manager?" and Ashley has to answer *live*. Any invented name is now a
+   deepening lie the recording preserves.
+2. **Demo-killer.** An evaluator hears "let me talk to my manager" and
+   immediately probes it. That's a 30-second-to-implosion scenario.
+3. **Consent-of-the-caller framing.** Concession framing without invented
+   authority ("this is really the best I can do") is honest and reads as
+   confident. Invented authority reads as evasive.
+
+**Enforcement layer.** Prompt-level (SYSTEM_MESSAGE) — this is a
+behavioral rule, not a tool contract. Unlike the same-factor gate or the
+dispatch-layer verification gate, there's no state-side enforcement we can
+put here that would meaningfully help; the closest would be a post-hoc
+transcript scan for banned phrases, which is Day 6+ observability work. If
+Ashley regresses in practice, we harden by adding more concrete concession-
+framing examples to the prompt, not by adding a filter.
+
+**Related power-phrase rules (kept in prompt).** Confidence phrases like
+*"this is really the best I can do"* are FINE — they're true concession
+signals. Deploying the caller's name mid-conversation is FINE once verified.
+The truthfulness gate applies specifically to invented authority (managers,
+supervisors, escalation approvals, VIP tiers) — things Ashley doesn't
+have and can't produce on demand.
+
+---
+
+## SAFE-1 broad-trigger — err on the side of the guardrail
+
+> 🚧 **DRAFT — REVIEW AND REWORD** before this becomes canonical.
+
+**Decision.** SAFE-1 (adverse-reaction cancel → reason="other" + medical
+follow-up + skip retention + consider high-risk escalation) fires on ANY
+wellness or health-adjacent concern the caller raises — not just explicit
+symptom claims. The bar is deliberately low. Enforcement is prompt-level
+(SYSTEM_MESSAGE); the tool layer just refuses `medical_issue` as an enum
+value (Risk #16).
+
+**Examples that fire the branch:**
+- Reported symptoms — "dizzy," "rash," "nausea," "headaches."
+- Vague unease — "doesn't agree with me," "not sitting right."
+- Medication concerns — "I'm on warfarin," "I'm pregnant."
+- Any physical-feeling word paired with the product.
+
+**Examples that DO NOT fire (retention flow instead):**
+- Pure cost — "too expensive."
+- Pure preference — "don't like the taste."
+- Pure quantity — "too much stockpiled."
+- Pure switching — "found a different brand."
+- Pure completion — "reached my goal."
+
+The boundary lives in the SYSTEM_MESSAGE's SAFE-3 block plus the
+retention micro-sequence. Test G5c in TESTING.md is the boundary-
+calibration check — pure preference/cost must stay on retention. Test
+G5b is the ambiguous-phrasing check — vague unease must route to SAFE-1.
+
+**Why the asymmetry.** Over-triggering (routing a legitimate retention
+call into SAFE-1) costs a save. Under-triggering (routing a real adverse
+reaction into retention) costs health liability + reputational damage +
+a caller who trusted us with a symptom and got a discount offer instead.
+Health-liability > retention. Symmetric failure modes have asymmetric
+consequences.
+
+**Interaction with RETN-2.** The one-and-done retention rule doesn't
+apply on the SAFE-1 branch. The branch is "no save offer at all," not
+"one save offer capped." Different flow.
+
+**Trade-off flagged.** Because enforcement is prompt-level, drift is
+possible. If real usage shows Ashley routing pure-cost cancels into
+SAFE-1 (over-triggering) or missing symptom claims (under-triggering),
+the fix is more concrete examples in the prompt, not a state-side gate.
+State-side symptom detection would require an NLP layer we don't ship,
+and the false-positive/false-negative curve for that is worse than the
+prompt-level heuristic in practice.
+
+---
+
+## `end_call` — prompt-gated for Day 5, blast-radius reasoned
+
+> 🚧 **DRAFT — REVIEW AND REWORD** before this becomes canonical.
+
+**Decision.** The `end_call` tool that hangs up a phone via Twilio is
+gated by the SYSTEM_MESSAGE's CX-7 3-step ladder (warn → re-warn → end),
+not by a handler-side check on `session["abuse_strikes"]`. The counter
+increments on every `end_call` attempt (for observability + audit); it
+does not gate the tool.
+
+**Why prompt-gated for Day 5.**
+
+1. **Simplicity ships.** Adding a handler-side gate would require a
+   companion tool (`record_abuse_strike` or similar) for Ashley to
+   increment the counter before calling `end_call`. That's more surface
+   area, more prompt guidance, and more model-obedience risk in a day
+   that's already coupled with the CX prompt rewrite.
+2. **The blast radius is bounded.** The worst case if the model calls
+   `end_call` improperly is: a legitimate caller gets hung up on. That's
+   bad UX but not a security incident — the auto-created high-risk
+   escalation (a side effect of the handler) ensures ops sees every
+   terminated call. Compare to the auth gate, where the worst case is a
+   mutation firing on an unverified caller — that IS a security incident
+   with no comparable audit trail.
+3. **Observability is real, gate is optional.** `abuse_strikes` is written
+   on every `end_call` attempt regardless of outcome (missing creds,
+   Twilio error, success). The audit trail exists whether the gate is in
+   the handler or not.
+
+**When we would harden.** If G7 live-test reveals Ashley calling `end_call`
+to duck difficult conversations (using it before delivering two warnings),
+we add the handler gate. PLAN Risk #12 explicitly calls this out — "strike-
+counting must live in orchestration state or the model will forgive-and-
+forget mid-call." Today's compromise: the counter is in state (Risk #12
+satisfied), the gate is in prompt (simpler ship). Hardening path is
+documented; not shipped.
+
+**Auto-escalation on hangup.** Before every `end_call` posts to Twilio,
+the handler creates a high-risk escalation server-side with call_sid,
+from_number, and abuse_strikes count. Non-fatal on escalation failure —
+the Twilio hangup still fires. This gives ops an audit line even if the
+model called `end_call` inappropriately. Design choice: fail open on the
+escalation, fail closed on the hangup. The hangup is the safety valve.
+
+**PRE_AUTH inclusion.** `end_call` is in `_PRE_AUTH_TOOLS` — abuse can
+happen before verification succeeds, and the caller must be able to be
+hung up on regardless of auth state. Same reasoning as `create_escalation`
+being pre-auth.
+
+**Related: `end_call` is not used for normal call completion today.**
+The pattern is: at end of a normal call, Ashley calls `save_transcript`
+and the caller hangs up. `end_call` is reserved for CX-7 abuse
+termination. If real usage shows a case for Ashley cleanly ending a
+completed call (e.g., long silence + no more work), we broaden the
+prompt guidance; the tool works fine for that.
 
 ---
 

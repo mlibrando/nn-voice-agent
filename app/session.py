@@ -89,4 +89,14 @@ def new_session() -> dict:
                                     # See DECISIONS.md draft "Located vs. verified" (updated
                                     # entry — the state check IS the enforcement; prompt hints
                                     # are not).
+        # ─── Day 5 CX / observability fields ───
+        "abuse_strikes": 0,         # CX-7 abuse ladder counter. Advisory today (prompt-gated
+                                    # end_call); logged into escalation body on hang-up. Day
+                                    # 6/8 may harden into a handler-side gate per PLAN Risk #12.
+        "retention_offer_made_for_subs": set(),
+                                    # RETN-2 soft belt — subscription_ids where Ashley already
+                                    # made a retention save offer this call. The HARD belt is
+                                    # `applied_discounts` (Day 3 discount lifecycle guard);
+                                    # this field is prompt-level advisory to prevent re-pitch
+                                    # even before a discount is applied.
     }
