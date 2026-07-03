@@ -135,23 +135,87 @@ async def _twilio_to_openai(
             elif event == "start":
                 session["stream_sid"] = msg["start"]["streamSid"]
                 session["call_sid"] = msg["start"].get("callSid")
+
+                # Day 4: capture Twilio `From` from customParameters (passed
+                # through by the /incoming-call TwiML `<Parameter>`). This is
+                # the input for Tier-0 caller-ID auth.
+                custom_params = msg["start"].get("customParameters") or {}
+                session["from_number"] = (custom_params.get("from") or "").strip() or None
                 log.info(
                     f"Stream started — stream_sid={session['stream_sid']}  "
-                    f"call_sid={session['call_sid']}"
+                    f"call_sid={session['call_sid']}  from={session['from_number']}"
                 )
-                # Proactive greeting (A1). The system prompt in
-                # SESSION_UPDATE_PAYLOAD sets the persona; this per-response
-                # instruction is a small nudge to make her speak *first* so
-                # the caller isn't sitting on silence. Full persona is Day 5.
+
+                # Tier-0 lookup: if we have a from_number, look up the account
+                # before the greeting so Ashley can personalize on a hit. The
+                # ~500ms mock ambient latency is worth the "greeted by name"
+                # feel on real callers; misses (evaluator path) get a generic
+                # greeting and clear instructions to fall back to Tier-1.
+                tier0_hit = False
+                first_name = ""
+                if session["from_number"]:
+                    lookup_result = await tool_handlers.customer_lookup(
+                        {"phone": session["from_number"]}, session,
+                    )
+                    tier0_hit = bool(session.get("tier0_hit"))
+                    first_name = lookup_result.get("customer_first_name", "") or ""
+                    log.info(
+                        f"Tier-0 lookup: {'HIT' if tier0_hit else 'MISS'} "
+                        f"(first_name={first_name!r})"
+                    )
+
+                # Inject a system-context message so the model has the auth
+                # state at greeting time. This is not persona — Day 5 refines
+                # phrasing; today's job is state visibility.
+                if tier0_hit and first_name:
+                    context_text = (
+                        f"Session context — caller ID: {session['from_number']}. "
+                        f"Tier-0 lookup: HIT (first name: {first_name}). "
+                        f"Greet warmly by first name and confirm identity — a "
+                        f"'yes' or their name suffices; then call "
+                        f"verify_identity(challenge_kind='caller_id_confirm', "
+                        f"given_value=<their affirmation>)."
+                    )
+                    greeting_instructions = (
+                        f"Greet {first_name} warmly by first name as Ashley "
+                        f"from Natural Nutrition, in ONE short sentence "
+                        f"(e.g. 'Hi {first_name}, this is Ashley from "
+                        f"Natural Nutrition — am I speaking with "
+                        f"{first_name}?'). Do NOT read back any other account "
+                        f"detail; wait for their confirmation."
+                    )
+                else:
+                    caller_id = session["from_number"] or "not provided"
+                    context_text = (
+                        f"Session context — caller ID: {caller_id}. "
+                        f"Tier-0 lookup: MISS (no matching customer). "
+                        f"Locate via order_number or email, then pose ONE "
+                        f"Tier-2 challenge (zip, email if located by order, "
+                        f"order_name, or card_last_four) and call verify_identity."
+                    )
+                    greeting_instructions = (
+                        "Greet the caller warmly as Ashley from Natural "
+                        "Nutrition and ask how you can help. Keep it to ONE "
+                        "short sentence — this is a phone call. Do not "
+                        "assume an identity."
+                    )
+
+                await openai_ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": context_text}],
+                    },
+                }))
+
+                # Proactive greeting (A1 — item-id-anchor barge-in relies on
+                # the model speaking first). Per-response instructions carry
+                # the personalized greeting on Tier-0 hit or the generic one
+                # on miss.
                 await openai_ws.send(json.dumps({
                     "type": "response.create",
-                    "response": {
-                        "instructions": (
-                            "Greet the caller warmly as Ashley from Natural "
-                            "Nutrition and ask how you can help. Keep it to "
-                            "one short sentence — this is a phone call."
-                        ),
-                    },
+                    "response": {"instructions": greeting_instructions},
                 }))
 
             elif event == "mark":

@@ -45,6 +45,11 @@ async def main() -> int:
     session = new_session()
     session["stream_sid"] = "SMTEST"
     session["call_sid"] = "CATEST"
+    # Day 4: existing tests were written before the auth gate. Pre-verify the
+    # session so customer_lookup returns the full record (verified=True path)
+    # and the dispatch gate lets mutations through. The dedicated auth section
+    # further down creates fresh unverified sessions to test the gate itself.
+    session["verified"] = True
 
     failures = 0
 
@@ -302,6 +307,416 @@ async def main() -> int:
             session,
         )
         _print("summary + outcome (handler builds transcript from session)", r)
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Day 4 — AUTH state machine assertions
+        # ═════════════════════════════════════════════════════════════════════
+        print()
+        print("╔═════════════════════════════════════════════════════════════════════╗")
+        print("║ AUTH LAYER (Day 4) — dispatch gate + tiered verification            ║")
+        print("╚═════════════════════════════════════════════════════════════════════╝")
+
+        # Reset mock state so auth flows work against a clean seed (previous
+        # tests cancelled/refunded things).
+        await tools_client.get_client().post("/admin/reset")
+
+        print()
+        print("── AUTH-1  Dispatch gate refuses mutations pre-verification ────────")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-1"
+        s["call_sid"] = "CA-AUTH-1"
+        # First locate so we have a candidate (mutation would otherwise fail on
+        # missing sub anyway — we want to prove the AUTH gate refuses, not the
+        # bad_request path).
+        _ = await h.customer_lookup({"phone": "+15125550101"}, s)
+        r = await h.dispatch("cancel_subscription", {"subscription_id": 50001, "reason": "other"}, s)
+        _print("dispatch(cancel_subscription) while unverified", r)
+        if r.get("ok") or r.get("error", {}).get("code") != "verification_required":
+            failures += 1
+            print(f"  FAIL: expected code=verification_required, got {r.get('error', {}).get('code')!r}")
+
+        # Verify the mock was NEVER hit — check by reading admin state.
+        state = (await tools_client.get_client().get("/admin/state")).json()
+        sub_50001 = next(
+            (s for s in state.get("subscriptions", []) if s.get("subscription_id") == 50001),
+            {},
+        )
+        if sub_50001.get("status") == "CANCELLED":
+            failures += 1
+            print("  FAIL: sub 50001 was cancelled — the gate leaked through to the mock")
+        else:
+            print("  ✓ mock never mutated (gate held before handler ran)")
+
+        print()
+        print("── AUTH-2  Sanitized customer_lookup pre-verification ─────────────")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-2"
+        s["call_sid"] = "CA-AUTH-2"
+        r = await h.customer_lookup({"phone": "+15125550101"}, s)
+        _print("pre-verify lookup returns minimal shape", r)
+        # Must include: ok, located, verification_required, customer_first_name.
+        # Must NOT include full customer/orders/subscriptions dumped to the model.
+        for required_key in ("ok", "located", "verification_required", "customer_first_name"):
+            if required_key not in r:
+                failures += 1
+                print(f"  FAIL: sanitized response missing key {required_key!r}")
+        for leaked_key in ("customer", "orders", "subscriptions"):
+            if leaked_key in r:
+                failures += 1
+                print(f"  FAIL: sanitized response LEAKED {leaked_key!r} — that hands the caller answers")
+        # Full record must still be in session.candidate_account for verify_identity.
+        if not (s.get("candidate_account") or {}).get("customer"):
+            failures += 1
+            print("  FAIL: session.candidate_account not populated with full record")
+        else:
+            print("  ✓ full record in session.candidate_account (for challenge check)")
+
+        print()
+        print("── AUTH-3  Tier-0 caller_id_confirm flips verified ─────────────────")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-3"
+        s["call_sid"] = "CA-AUTH-3"
+        s["from_number"] = "+15125550101"  # Simulates bridge capturing Twilio From
+        _ = await h.customer_lookup({"phone": "+15125550101"}, s)
+        if not s.get("tier0_hit"):
+            failures += 1
+            print("  FAIL: tier0_hit should be True when from_number == looked-up phone")
+        r = await h.verify_identity({"challenge_kind": "caller_id_confirm", "given_value": "yes it is"}, s)
+        _print("verify_identity(caller_id_confirm, 'yes it is')", r)
+        if not r.get("ok") or not r.get("verified"):
+            failures += 1
+            print("  FAIL: Tier-0 confirm should flip verified=True")
+        if not s.get("verified") or not s.get("customer") or s.get("candidate_account") is not None:
+            failures += 1
+            print("  FAIL: post-verify session state incorrect")
+
+        print()
+        print("── AUTH-4  caller_id_confirm refused without Tier-0 hit ────────────")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-4"
+        s["call_sid"] = "CA-AUTH-4"
+        # No from_number — evaluator path. Locate via order_number instead.
+        _ = await h.customer_lookup({"order_number": "#NN1001"}, s)
+        if s.get("tier0_hit"):
+            failures += 1
+            print("  FAIL: tier0_hit must be False for a Tier-1 locate")
+        r = await h.verify_identity({"challenge_kind": "caller_id_confirm", "given_value": "yes"}, s)
+        _print("verify_identity(caller_id_confirm) on Tier-1 locate", r)
+        if r.get("ok") or r.get("error", {}).get("code") != "caller_id_didnt_match":
+            failures += 1
+            print("  FAIL: expected code=caller_id_didnt_match")
+
+        print()
+        print("── AUTH-5  Tier-2 zip passes with normalization ────────────────────")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-5"
+        s["call_sid"] = "CA-AUTH-5"
+        _ = await h.customer_lookup({"phone": "+15125550101"}, s)  # Margaret, ZIP 78701
+        on_file = h._collect_on_file_zips(s["candidate_account"])
+        print(f"  on-file ZIPs collected across sub+order shipping: {on_file}")
+        if "78701" not in on_file:
+            failures += 1
+            print("  FAIL: expected 78701 in the on-file ZIP set")
+
+        # Plain digits
+        r = await h.verify_identity({"challenge_kind": "zip", "given_value": "78701"}, s)
+        _print("verify_identity(zip, '78701')", r)
+        if not r.get("ok") or not r.get("verified"):
+            failures += 1
+            print("  FAIL: correct ZIP should verify")
+
+        # Fresh session — test normalization ("seven eight seven oh one" style)
+        s2 = new_session()
+        _ = await h.customer_lookup({"phone": "+15125550101"}, s2)
+        r = await h.verify_identity({"challenge_kind": "zip", "given_value": " 78701 "}, s2)
+        if not r.get("ok"):
+            failures += 1
+            print("  FAIL: whitespace-padded ZIP should normalize and match")
+        else:
+            print("  ✓ ZIP normalizes correctly (whitespace stripped)")
+
+        print()
+        print("── AUTH-6  Wrong answer → verification_failed + attempts_remaining ─")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-6"
+        s["call_sid"] = "CA-AUTH-6"
+        _ = await h.customer_lookup({"phone": "+15125550101"}, s)
+        r = await h.verify_identity({"challenge_kind": "zip", "given_value": "99999"}, s)
+        _print("verify_identity(zip, '99999') — wrong", r)
+        if r.get("ok") or r.get("error", {}).get("code") != "verification_failed":
+            failures += 1
+            print("  FAIL: wrong answer should return code=verification_failed")
+        if r.get("attempts_remaining") != 2:
+            failures += 1
+            print(f"  FAIL: attempts_remaining should be 2, got {r.get('attempts_remaining')}")
+        if s.get("verified"):
+            failures += 1
+            print("  FAIL: session.verified must not flip on wrong answer")
+
+        print()
+        print("── AUTH-7  Attempt cap → locked_out with self-contained escalation ─")
+        # We already used 1 attempt in AUTH-6 (same session s). Use 2 more.
+        r2 = await h.verify_identity({"challenge_kind": "zip", "given_value": "88888"}, s)
+        r3 = await h.verify_identity({"challenge_kind": "zip", "given_value": "77777"}, s)
+        _print("2nd wrong", r2)
+        _print("3rd wrong (should trigger locked_out)", r3)
+        if r3.get("error", {}).get("code") != "locked_out":
+            failures += 1
+            print("  FAIL: 3rd wrong should trigger locked_out")
+        # Self-contained signal check.
+        for required in ("spoken_line", "next_action", "escalation_suggestion"):
+            if required not in r3:
+                failures += 1
+                print(f"  FAIL: locked_out result missing {required!r}")
+        esc = r3.get("escalation_suggestion") or {}
+        for esc_field in ("issue_for_human", "actions_taken", "mark_high_risk"):
+            if esc_field not in esc:
+                failures += 1
+                print(f"  FAIL: escalation_suggestion missing {esc_field!r}")
+        # The issue_for_human string should reference the call_sid AND the caller's name.
+        issue = esc.get("issue_for_human", "")
+        if "CA-AUTH-6" not in issue or "Margaret" not in issue:
+            failures += 1
+            print(f"  FAIL: issue_for_human should reference call_sid + candidate name; got: {issue!r}")
+        else:
+            print("  ✓ locked_out payload is fully self-contained (spoken_line + escalation_suggestion)")
+
+        # 4th attempt should also return locked_out (idempotent).
+        r4 = await h.verify_identity({"challenge_kind": "zip", "given_value": "78701"}, s)
+        if r4.get("error", {}).get("code") != "locked_out":
+            failures += 1
+            print("  FAIL: post-cap verify_identity must stay locked_out (even correct answers)")
+
+        print()
+        print("── AUTH-8  cust_006 Robert Lee — phone null forces email path ─────")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-8"
+        s["call_sid"] = "CA-AUTH-8"
+        # No from_number to look up; caller can't be located by phone.
+        r_bogus = await h.customer_lookup({"phone": "+15129999999"}, s)
+        _print("bogus phone (expect 404)", r_bogus)
+        if r_bogus.get("ok"):
+            failures += 1
+            print("  FAIL: bogus phone should return not_found, not ok=True")
+
+        # Now Tier-1 locate by email.
+        r_by_email = await h.customer_lookup({"email": "robert.lee@example.com"}, s)
+        _print("locate by email (cust_006)", r_by_email)
+        if not r_by_email.get("ok"):
+            failures += 1
+            print("  FAIL: cust_006 email lookup should succeed")
+        if r_by_email.get("customer_first_name") != "Robert":
+            failures += 1
+            print(f"  FAIL: expected first_name=Robert, got {r_by_email.get('customer_first_name')!r}")
+
+        # Verify by order_name (Robert's order_ids per seed: #NN1006 → gid://.../1006).
+        # Note: verification via card_last_four would also work; using order_name here
+        # per the moderate-strength-knowledge-factor decision (see DECISIONS.md draft).
+        r_verify = await h.verify_identity({"challenge_kind": "order_name", "given_value": "#NN1006"}, s)
+        _print("verify_identity(order_name, '#NN1006')", r_verify)
+        if not r_verify.get("ok"):
+            failures += 1
+            print("  FAIL: correct order_name should verify cust_006")
+
+        print()
+        print("── AUTH-9  Post-verification customer_lookup returns full record ───")
+        # `s` is now verified as Robert. A re-lookup should NOT sanitize.
+        r_reread = await h.customer_lookup({"email": "robert.lee@example.com"}, s)
+        if not r_reread.get("customer") or not r_reread.get("orders"):
+            failures += 1
+            print("  FAIL: verified caller's re-lookup should return full record")
+        else:
+            print("  ✓ verified caller gets the full record on re-lookup")
+
+        print()
+        print("── AUTH-10 Pre-auth tools work unverified (create_escalation/save_transcript)")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-10"
+        s["call_sid"] = "CA-AUTH-10"
+        s["from_number"] = "+15129999999"
+        r_esc = await h.dispatch(
+            "create_escalation",
+            {"issue_for_human": "Caller wants a manager. Cannot verify identity."},
+            s,
+        )
+        _print("dispatch(create_escalation) while unverified", r_esc)
+        if not r_esc.get("ok"):
+            failures += 1
+            print("  FAIL: create_escalation MUST run pre-verify (unauth path)")
+
+        r_tx = await h.dispatch("save_transcript", {"summary": "x", "outcome": "informational"}, s)
+        _print("dispatch(save_transcript) while unverified", r_tx)
+        if not r_tx.get("ok"):
+            failures += 1
+            print("  FAIL: save_transcript MUST run pre-verify (end-of-call regardless)")
+
+        print()
+        print("── AUTH-11 from_number lands in unauth escalation breadcrumb ───────")
+        # Confirm the escalation the mock received includes the from_number correlation key.
+        state = (await tools_client.get_client().get("/admin/state")).json()
+        escs = state.get("escalations", [])
+        # Find our just-created one by call_sid marker.
+        ours = [e for e in escs if "CA-AUTH-10" in (e.get("customer_details") or "")]
+        if not ours:
+            failures += 1
+            print("  FAIL: created escalation not found in mock state")
+        else:
+            details = ours[-1].get("customer_details", "")
+            if "from=+15129999999" not in details:
+                failures += 1
+                print(f"  FAIL: from_number missing from escalation breadcrumb. Got: {details!r}")
+            else:
+                print(f"  ✓ escalation breadcrumb: {details[:100]}")
+
+        print()
+        print("── AUTH-12 Dispatch gate allows reads-after-verify, blocks pre-verify")
+        # Reads (get_customer_orders etc.) are ALSO gated (they're data disclosure).
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-12"
+        s["call_sid"] = "CA-AUTH-12"
+        _ = await h.customer_lookup({"phone": "+15125550101"}, s)
+        r_read = await h.dispatch("get_customer_orders", {"customer_id": "cust_001"}, s)
+        _print("dispatch(get_customer_orders) while unverified", r_read)
+        if r_read.get("ok"):
+            failures += 1
+            print("  FAIL: get_customer_orders must be gated (data disclosure)")
+        # Now verify and retry.
+        s["from_number"] = "+15125550101"
+        s["tier0_hit"] = True  # simulate — normally set by customer_lookup phone match
+        await h.verify_identity({"challenge_kind": "caller_id_confirm", "given_value": "yes"}, s)
+        r_read2 = await h.dispatch("get_customer_orders", {"customer_id": "cust_001"}, s)
+        if not r_read2.get("ok"):
+            failures += 1
+            print("  FAIL: post-verify get_customer_orders should succeed")
+        else:
+            print("  ✓ gate correctly refuses pre-verify reads AND allows post-verify reads")
+
+        print()
+        print("── AUTH-13 Same-factor: located via email, email challenge REFUSED ──")
+        # This is the F8-live bug: caller supplied email as locate identifier,
+        # Ashley then accepted the same email as the verify challenge. That's
+        # zero-factor auth. Handler MUST refuse with code=same_factor.
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-13"
+        s["call_sid"] = "CA-AUTH-13"
+        r = await h.customer_lookup({"email": "david.thompson@example.com"}, s)
+        if s.get("located_via") != "email":
+            failures += 1
+            print(f"  FAIL: located_via should be 'email', got {s.get('located_via')!r}")
+        else:
+            print(f"  ✓ located_via='email' set by customer_lookup")
+
+        # Attempt the same-factor challenge — MUST be refused.
+        attempts_before = s.get("auth_attempts", 0)
+        r = await h.verify_identity(
+            {"challenge_kind": "email", "given_value": "david.thompson@example.com"}, s,
+        )
+        _print("verify_identity(email) after locating via email", r)
+        if r.get("ok") or r.get("error", {}).get("code") != "same_factor":
+            failures += 1
+            print(f"  FAIL: expected code=same_factor, got {r.get('error', {}).get('code')!r}")
+        if s.get("verified"):
+            failures += 1
+            print("  FAIL: verified must NOT flip on same-factor refusal — regression of the F8-live bug")
+        # Must NOT count against the attempt budget.
+        if s.get("auth_attempts", 0) != attempts_before:
+            failures += 1
+            print(f"  FAIL: same-factor rejection should not increment auth_attempts (before={attempts_before}, after={s['auth_attempts']})")
+        else:
+            print("  ✓ same-factor rejection does not count as a failed attempt")
+
+        # Positive control: a DIFFERENT Tier-2 challenge still works.
+        # David Thompson's on-file ZIP is 80202 (both subs + order).
+        r = await h.verify_identity({"challenge_kind": "zip", "given_value": "80202"}, s)
+        _print("verify_identity(zip) after locating via email — legitimate", r)
+        if not r.get("ok") or not r.get("verified"):
+            failures += 1
+            print("  FAIL: legitimate DIFFERENT-factor challenge should verify")
+
+        print()
+        print("── AUTH-14 Same-factor: located via order_number, order_name REFUSED ")
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-14"
+        s["call_sid"] = "CA-AUTH-14"
+        r = await h.customer_lookup({"order_number": "#NN1001"}, s)
+        if s.get("located_via") != "order_number":
+            failures += 1
+            print(f"  FAIL: located_via should be 'order_number', got {s.get('located_via')!r}")
+
+        r = await h.verify_identity(
+            {"challenge_kind": "order_name", "given_value": "#NN1001"}, s,
+        )
+        _print("verify_identity(order_name) after locating via order_number", r)
+        if r.get("ok") or r.get("error", {}).get("code") != "same_factor":
+            failures += 1
+            print(f"  FAIL: expected code=same_factor, got {r.get('error', {}).get('code')!r}")
+        if s.get("verified"):
+            failures += 1
+            print("  FAIL: verified must NOT flip on same-factor refusal")
+
+        # Positive control: email (a different factor) works.
+        r = await h.verify_identity(
+            {"challenge_kind": "email", "given_value": "margaret.chen@example.com"}, s,
+        )
+        if not r.get("ok"):
+            failures += 1
+            print("  FAIL: legitimate different-factor (email) after order-number locate should verify")
+        else:
+            print("  ✓ different-factor challenge (email) verifies after order_number locate")
+
+        print()
+        print("── AUTH-15 Tier-0 carve-out: phone match → caller_id_confirm allowed ")
+        # The ambient-physical-signal reasoning: caller-ID is not a
+        # caller-supplied claim, so it's OK to use phone for both locate and
+        # verbal confirm on Tier-0 hits. Same-factor gate must NOT block.
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-15"
+        s["call_sid"] = "CA-AUTH-15"
+        s["from_number"] = "+15125550101"  # Simulates bridge-captured Twilio From
+        r = await h.customer_lookup({"phone": "+15125550101"}, s)
+        if not s.get("tier0_hit"):
+            failures += 1
+            print("  FAIL: tier0_hit should be True for from_number == lookup phone")
+        if s.get("located_via") != "phone":
+            failures += 1
+            print(f"  FAIL: located_via should be 'phone', got {s.get('located_via')!r}")
+
+        r = await h.verify_identity(
+            {"challenge_kind": "caller_id_confirm", "given_value": "yes"}, s,
+        )
+        _print("verify_identity(caller_id_confirm) on Tier-0 hit", r)
+        if not r.get("ok") or not r.get("verified"):
+            failures += 1
+            print("  FAIL: caller_id_confirm on Tier-0 hit must verify (ambient-signal carve-out)")
+        else:
+            print("  ✓ Tier-0 carve-out preserved: caller_id_confirm passes on caller-ID match")
+
+        print()
+        print("── AUTH-16 tier0_hit invariant: caller cannot forge via lookup args ")
+        # Attacker calls from unseeded +15559999999 but tries to pass Margaret's
+        # phone to customer_lookup. tier0_hit MUST stay False because the
+        # lookup phone != from_number.
+        s = new_session()
+        s["stream_sid"] = "SM-AUTH-16"
+        s["call_sid"] = "CA-AUTH-16"
+        s["from_number"] = "+15559999999"  # Attacker's unseeded number
+        # Locate Margaret by phone — the lookup succeeds but tier0_hit must NOT set.
+        r = await h.customer_lookup({"phone": "+15125550101"}, s)
+        if s.get("tier0_hit"):
+            failures += 1
+            print("  FAIL: tier0_hit forged — lookup_phone != from_number should keep it False")
+        else:
+            print("  ✓ tier0_hit stayed False (lookup_phone != from_number)")
+
+        # Now try caller_id_confirm — MUST be refused with caller_id_didnt_match.
+        r = await h.verify_identity(
+            {"challenge_kind": "caller_id_confirm", "given_value": "yes"}, s,
+        )
+        if r.get("ok") or r.get("error", {}).get("code") != "caller_id_didnt_match":
+            failures += 1
+            print(f"  FAIL: caller_id_confirm should be refused when tier0_hit=False, got {r.get('error', {}).get('code')!r}")
+        else:
+            print("  ✓ caller_id_confirm refused when tier0_hit=False (invariant holds)")
 
     finally:
         await tools_client.shutdown()

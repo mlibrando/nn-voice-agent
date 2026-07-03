@@ -449,10 +449,26 @@ Returns `{ "transcript_id", "saved": true }`; also appends one JSON line to `tra
 - Product knowledge, health guardrail, CX prompt content — Day 5.
 - Filler on tool dispatch — Day 6 (marker in place).
 
-### Day 4 — Thu Jul 2 · Auth/verification state machine
-- Tier 0 caller-ID lookup from Twilio `From`; Tier 1 fallback (order #/email); Tier 2 challenge against real fields; gate all mutations + data disclosure behind `verified`. → AUTH-1,2,3
-- Edge tests: `cust_006` (no phone), evaluator-style call from a non-seeded number, ignore order `shipping_address.phone`. → AUTH-2/3 edges
-- **Wk-1 checkpoint readiness.** → CONV-5
+### Day 4 — Thu Jul 2 · Auth/verification state machine — **DONE**
+
+**Landed:**
+- **Twilio `From` capture** via TwiML `<Parameter>` in `/incoming-call` (XML-escaped); bridge reads it from `msg["start"]["customParameters"]["from"]` on stream start into `session["from_number"]`. → AUTH-1 (input)
+- **Tier-0 auto-lookup** in bridge `start` branch: `customer_lookup(phone=from_number)` runs before greeting; on hit, `session["tier0_hit"] = True`; personalized-by-name greeting instructions fire; on miss, generic greeting + system-context tells Ashley to fall back to Tier-1. → AUTH-1
+- **Tier-1 fallback** — `customer_lookup(order_number=…)` and `customer_lookup(email=…)` both work pre-verification, cache candidate account, do NOT set `tier0_hit`. Evaluator path + `cust_006` (`phone: null`) both proven in the smoke test. → AUTH-2
+- **Tier-2 challenge tool** — new `verify_identity(challenge_kind, given_value)`. Kinds: `caller_id_confirm` (Tier-0 only), `zip`, `email`, `order_name`, `card_last_four`. Normalized compare per kind. **ZIP accepts either the subscription's OR any order's `shipping_address.zip`** — both legitimately "on file"; precedence documented in DECISIONS.md draft. **`line_item_title` deliberately excluded** (small catalog + loose match = low entropy). SALE-only for card last-4 (refund txns have null card, IFACE gotcha #7). → AUTH-3
+- **The gate lives at `handlers.dispatch()`** — not in the prompt. `_PRE_AUTH_TOOLS = {customer_lookup, verify_identity, create_escalation, save_transcript}`; every other tool refuses with `code=verification_required` when `session["verified"]` is False. Reads are gated too, not just mutations. See DECISIONS.md draft "Located vs. verified". → AUTH-3 (real enforcement)
+- **`customer_lookup` sanitizes pre-verification.** Full record cached in `session["candidate_account"]`; the tool result returned to the model is minimized to `{ok, located, verification_required, customer_first_name, tier0_hit, _note}`. Ashley can't read back an address or email before asking the challenge. → AUTH-3 (don't-leak-challenge)
+- **Attempt cap = 3.** 4th `verify_identity` call returns `code=locked_out` with a **self-contained** escalation payload: `spoken_line` (caller-facing verbiage), `next_action: "create_escalation"`, and prefilled `escalation_suggestion` args. The graceful degradation lives in the tool result — a legitimate caller on a bad line lands in the escalation path even if the prompt is stripped or drifted. → AUTH-3 (edges)
+- **Order shipping phone never treated as identity signal.** No `verify_identity` challenge kind sources from `shipping_address.phone`. Documented in TESTING.md F6 anti-authentication test. → AUTH-2/3 edges
+- **Deferred Day-3 hook consumed:** `create_escalation` unauth breadcrumb now includes `from=<number>` alongside `call_sid=<X>` so ops can call back an unverified caller.
+- **SYSTEM_MESSAGE — minimal auth-flow steering** added to `config.py` (not persona; Day 5 warms it). Explains the flow to the model + the "don't read back details before verify" rule.
+- **Handler-level test suite — 12 auth cases** added to `scripts/test_tools.py`; all green against local mock. Includes the "mock was never mutated" check for AUTH-1 to prove the gate held before the handler ran.
+- **Live-call sweep** — TESTING.md Section F (F1–F8) added with per-test log signals, pass/fail criteria, and SSH bonus-checks for `admin/state` verification.
+- **DECISIONS.md** — two new draft entries appended: "Located vs. verified + dispatch-gate as core security decision" and "Order name as moderate-strength knowledge factor" — both flagged 🚧 DRAFT for self-rewording.
+
+**Deferred (per scope):** CX/persona prompt content, product-knowledge block (KNOW-1), health guardrail (SAFE-3), filler on tool dispatch, TOOL-END, P1 tools — Day 5/6.
+
+**Wk-1 checkpoint readiness.** → CONV-5
 
 ### Day 5 — Fri Jul 3 · Prompt-for-voice + **CX behavior spec baked into the prompt** + P0 side-effect tools + TOOL-END
 - Adapt `variant_a` for voice: strip markdown/bullets, keep persona, retention sequence, escalation rules; short turns. → CONV-4, RETN-1, DATA-1 (Natural Nutrition substituted throughout)
