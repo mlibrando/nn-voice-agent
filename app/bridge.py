@@ -38,6 +38,52 @@ from app.tools import handlers as tool_handlers
 log = logging.getLogger(__name__)
 
 
+# Cancel reasons that signal a SAFE-1 adverse-reaction branch — softer register.
+_SAFE1_CANCEL_REASONS = {"other"}  # today "other" catches the SAFE-1 branch;
+#   Day 6 may expand if the enum grows.
+
+
+def _register_hint_for(tool_name: str, args: dict, result: dict) -> str | None:
+    """Return a per-response `instructions` string to nudge the emotional
+    register after a tool call, or None to leave register unchanged.
+
+    Risk #9 workaround: Realtime API has no emotion tags. We steer prosody
+    via short instruction nudges on the response following specific tool
+    categories. This is a small, targeted addition — not a general-purpose
+    "act sad now" mechanism. It applies where the CX cost of a rushed or
+    flat delivery is highest: adverse-reaction cancels, abuse warnings,
+    and retention-reason capture.
+
+    None keeps the current SYSTEM_MESSAGE prosody. Returning a string sends
+    that as the response-level `instructions`, which OpenAI Realtime treats
+    as a one-turn override.
+    """
+    # SAFE-1 adverse-reaction cancel — softer, slower, care-first.
+    if tool_name == "cancel_subscription":
+        reason = (args.get("reason") or "").strip().lower()
+        if reason in _SAFE1_CANCEL_REASONS and result.get("ok"):
+            return (
+                "Speak softly and unhurried. This may be a health-related "
+                "cancellation. Confirm the cancel briefly, encourage them "
+                "to check with their healthcare provider, and offer no "
+                "retention save. Warmth over efficiency here."
+            )
+    # CX-7 abuse ladder — end_call fires the hangup; be brief, professional,
+    # not chatty.
+    if tool_name == "end_call":
+        return (
+            "Speak the spoken_line briefly and calmly, then stop. Do not "
+            "elaborate. The call is ending."
+        )
+    # RETN-1/2 retention — capture reason with warmth, not sales energy.
+    if tool_name == "customer_lookup":
+        # A common flow is: caller asks to cancel → we look up → we ask the
+        # reason. Softening customer_lookup's follow-up only makes sense
+        # when the caller has already signaled cancel intent. Skip for now.
+        return None
+    return None
+
+
 def _delta_audio_ms(b64_delta: str) -> float:
     """Compute the duration in ms of one base64-encoded g711 μ-law audio chunk.
 
@@ -164,25 +210,37 @@ async def _twilio_to_openai(
                         f"(first_name={first_name!r})"
                     )
 
-                # Inject a system-context message so the model has the auth
-                # state at greeting time. This is not persona — Day 5 refines
-                # phrasing; today's job is state visibility.
+                # ─── Day-5 open-greeting rule ────────────────────────────
+                # We inject the auth state to the model via the system-context
+                # message (below), so the model KNOWS the located first name
+                # on Tier-0 hit — but the greeting instructions NEVER name
+                # the caller. This closes two things:
+                #   • Privacy: whoever picks up Margaret's phone (spouse,
+                #     kid, thief) does not learn we have Margaret on file.
+                #   • Auth: an open "who am I speaking with?" forces the
+                #     caller to ACTIVELY CLAIM an identity, which
+                #     _is_affirmative then matches against the located
+                #     first_name.
+                #
+                # ⚠ COUPLED WITH handlers._is_affirmative (~line 125).
+                # The open greeting invites "This is <name>" answers; the
+                # tightened _is_affirmative rejects any name claim that
+                # doesn't equal the located first_name. Do not loosen the
+                # greeting to volunteer the name without re-thinking
+                # _is_affirmative's whole-name check. See TESTING.md F6
+                # and AUTH-17..21 in scripts/test_tools.py.
                 if tier0_hit and first_name:
                     context_text = (
                         f"Session context — caller ID: {session['from_number']}. "
-                        f"Tier-0 lookup: HIT (first name: {first_name}). "
-                        f"Greet warmly by first name and confirm identity — a "
-                        f"'yes' or their name suffices; then call "
+                        f"Tier-0 lookup: HIT (first name on file: {first_name}). "
+                        f"After the caller states their name, call "
                         f"verify_identity(challenge_kind='caller_id_confirm', "
-                        f"given_value=<their affirmation>)."
-                    )
-                    greeting_instructions = (
-                        f"Greet {first_name} warmly by first name as Ashley "
-                        f"from Natural Nutrition, in ONE short sentence "
-                        f"(e.g. 'Hi {first_name}, this is Ashley from "
-                        f"Natural Nutrition — am I speaking with "
-                        f"{first_name}?'). Do NOT read back any other account "
-                        f"detail; wait for their confirmation."
+                        f"given_value=<their answer verbatim>). The handler "
+                        f"accepts the correct first name OR a bare "
+                        f"affirmative; a claimed name that doesn't match "
+                        f"{first_name} will fail and burn a verification "
+                        f"attempt. DO NOT volunteer the name '{first_name}' "
+                        f"in your greeting — wait for the caller to state it."
                     )
                 else:
                     caller_id = session["from_number"] or "not provided"
@@ -191,14 +249,28 @@ async def _twilio_to_openai(
                         f"Tier-0 lookup: MISS (no matching customer). "
                         f"Locate via order_number or email, then pose ONE "
                         f"Tier-2 challenge (zip, email if located by order, "
-                        f"order_name, or card_last_four) and call verify_identity."
+                        f"order_name, or card_last_four) and call "
+                        f"verify_identity."
                     )
-                    greeting_instructions = (
-                        "Greet the caller warmly as Ashley from Natural "
-                        "Nutrition and ask how you can help. Keep it to ONE "
-                        "short sentence — this is a phone call. Do not "
-                        "assume an identity."
-                    )
+
+                # Greeting instructions are IDENTICAL on hit and miss —
+                # Ashley never volunteers the located name (see coupling
+                # comment above).
+                greeting_instructions = (
+                    "Greet the caller warmly as Ashley from Natural Nutrition "
+                    "in ONE short sentence, and ask openly who you're "
+                    "speaking with. Two acceptable shapes: "
+                    "'Hi, this is Ashley from Natural Nutrition — who do I "
+                    "have the pleasure of speaking with?' or "
+                    "'Hi, this is Ashley from Natural Nutrition — am I "
+                    "speaking with the account holder?'. NEVER name the "
+                    "caller in your greeting, even if you've been told a name "
+                    "in system context — that's a privacy leak (their phone "
+                    "may be answered by someone else) and it invites a "
+                    "reflexive 'yes' instead of an active identity claim. "
+                    "Wait for them to state their name; then call "
+                    "verify_identity."
+                )
 
                 await openai_ws.send(json.dumps({
                     "type": "conversation.item.create",
@@ -327,8 +399,16 @@ async def _openai_to_twilio(
                         "output": json.dumps(result),
                     },
                 }))
-                # 2. Ask the model to speak with the result in hand
-                await openai_ws.send(json.dumps({"type": "response.create"}))
+                # 2. Ask the model to speak with the result in hand.
+                #    Day 5: nudge the emotional register on tool categories
+                #    that deserve softer/slower prosody. Risk #9 workaround —
+                #    Realtime has no emotion tags, so we steer via per-response
+                #    instructions.
+                register_hint = _register_hint_for(name, args, result)
+                response_body: dict = {"type": "response.create"}
+                if register_hint:
+                    response_body["response"] = {"instructions": register_hint}
+                await openai_ws.send(json.dumps(response_body))
 
             # --- Barge-in: truncate the item at the actual audio-out offset ---
             elif event_type == "input_audio_buffer.speech_started":

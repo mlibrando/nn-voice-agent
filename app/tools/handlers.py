@@ -64,11 +64,23 @@ def _cache_sub(session: dict, sub: dict) -> None:
 # --------------------------------------------------------------------------- #
 _MAX_AUTH_ATTEMPTS = 3
 
-_AFFIRMATIVE_WORDS = {
-    "yes", "yeah", "yep", "yup", "sure", "correct", "right", "confirm",
-    "confirmed", "affirmative", "that's me", "thats me", "speaking",
-    "this is",
+# _is_affirmative token sets. See docstring on _is_affirmative for the semantics.
+# COUPLED WITH bridge.py's Tier-0 open greeting (~line 170) — the open
+# greeting invites "This is <name>" style answers, and _is_affirmative must
+# reject "This is <wrong-name>" without the correct first_name. Do not
+# loosen these sets without re-reading _is_affirmative's docstring and the
+# AUTH-17..21 tests in scripts/test_tools.py.
+_AFFIRMATIVE_TOKENS = {
+    "yes", "yeah", "yep", "yup", "sure", "correct", "right", "ok", "okay",
+    "confirm", "confirmed", "affirmative", "certainly", "absolutely",
 }
+_STOP_TOKENS = {
+    "i", "am", "it", "is", "that", "the", "so", "and", "well", "uh", "um",
+    "just", "me", "a", "to",
+}
+_MULTI_WORD_AFFIRMATIVES = (
+    "that's me", "thats me", "it's me", "its me", "you got it",
+)
 
 
 def _digits(s: str | None) -> str:
@@ -123,16 +135,57 @@ def _most_recent_order_name(candidate: dict) -> str | None:
 
 
 def _is_affirmative(given: str, first_name: str) -> bool:
-    """Loose match for `caller_id_confirm`: 'yes', 'that's me', or their first
-    name mentioned anywhere in the answer counts."""
-    g = _norm(given)
+    """Match for `caller_id_confirm`.
+
+    Verifies iff EITHER:
+      (a) the located `first_name` appears as a whole word in the answer, OR
+      (b) the answer is a bare affirmative — every token is in
+          _AFFIRMATIVE_TOKENS or _STOP_TOKENS, OR the answer contains one of
+          _MULTI_WORD_AFFIRMATIVES.
+
+    Critically, an answer that STATES a name (e.g. "This is Bob", "I'm Bob",
+    "Yeah, Bob") does NOT pass unless the named person is the located
+    first_name. This is the fix for the F8-live open-greeting bypass, where
+    the previous substring-match implementation matched "this is" and
+    "speaking" anywhere in the answer.
+
+    Examples (first_name="Margaret"):
+        "yes"                            → True  (bare affirmative)
+        "yeah, I am"                     → True  (all tokens in sets)
+        "Margaret"                       → True  (name path)
+        "This is Margaret"               → True  (name path)
+        "Yes, this is Margaret"          → True  (name path)
+        "This is Bob"                    → False (name claim, wrong name)
+        "Yeah, Bob"                      → False (extra token 'bob' not in sets)
+        "It's me"                        → True  (multi-word affirmative)
+
+    COUPLED WITH bridge.py's Tier-0 open greeting. Any relaxation of this
+    function must be tested against AUTH-17..21 (impostor "This is Bob"
+    cases) and re-argued against the same-factor / located-vs-verified
+    invariants in DECISIONS.md.
+    """
+    if not given:
+        return False
+    g = _norm(given).strip(".!? ,")
     if not g:
         return False
-    if first_name and _norm(first_name) in g:
-        return True
-    for word in _AFFIRMATIVE_WORDS:
-        if word in g:
+    normalized_first = _norm(first_name) if first_name else ""
+
+    # (a) Correct first_name as a whole word.
+    if normalized_first:
+        if re.search(r"\b" + re.escape(normalized_first) + r"\b", g):
             return True
+
+    # (b1) Multi-word affirmative phrases anywhere in the answer.
+    if any(phrase in g for phrase in _MULTI_WORD_AFFIRMATIVES):
+        return True
+
+    # (b2) All tokens are affirmative or stop-tokens — no unrecognized words
+    # (which would include foreign names, extra content, or claimed identities).
+    tokens = re.findall(r"[a-z']+", g)
+    if tokens and all(t in _AFFIRMATIVE_TOKENS or t in _STOP_TOKENS for t in tokens):
+        return True
+
     return False
 
 
@@ -778,6 +831,130 @@ async def save_transcript(args: dict, session: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# TOOL-END — end_call (Day 5, CX-7 abuse ladder termination)
+# --------------------------------------------------------------------------- #
+async def end_call(args: dict, session: dict) -> dict:
+    """Terminate the current Twilio call via the Twilio REST API.
+
+    Design decisions (see DECISIONS.md drafts for the reasoning):
+      • Prompt-gated for Day 5: the handler does not check abuse_strikes.
+        The 3-step ladder (warn → re-warn → end) lives in SYSTEM_MESSAGE.
+        Day 6/8 may harden with a handler-side strike gate per PLAN Risk #12.
+      • Auto-escalation: before hanging up, we call create_escalation with
+        mark_high_risk=true so ops has an audit trail — non-fatal on
+        escalation failure (the call still ends).
+      • Twilio REST call-update: POST to Calls/{CallSid}.json with
+        Status=completed. Basic auth using TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN
+        from env. If creds are missing (local dev without .env), returns a
+        structured error rather than crashing — the model can degrade to
+        "please hang up when you're ready" language.
+      • Bridge cleanup: the Twilio side will send a `stop` event within ~1s
+        of the call terminating, which the bridge already handles cleanly.
+        No bridge changes needed.
+    """
+    import base64
+    from app.config import TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+
+    reason = (args.get("reason") or "").strip() or "no reason given"
+    call_sid = session.get("call_sid")
+
+    # Bump the observability counter FIRST, before any early-return path.
+    # Advisory only — the ladder gate lives in the prompt. But we want the
+    # counter to reflect ATTEMPTS (Ashley tried to end the call), not just
+    # SUCCESSFUL hangups. This is important for auditability if end_call
+    # fails for any reason (missing creds, Twilio error) and the caller
+    # stays on the line.
+    session["abuse_strikes"] = session.get("abuse_strikes", 0) + 1
+    log.info(
+        f"end_call: attempt call_sid={call_sid} reason={reason!r} "
+        f"abuse_strikes={session['abuse_strikes']}"
+    )
+
+    if not call_sid:
+        return _error(
+            "no_call_sid",
+            "Cannot end call — session has no call_sid. This should not "
+            "happen on a real call; check bridge.py start event.",
+        )
+
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
+        log.error("end_call: missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN env")
+        return _error(
+            "credentials_missing",
+            "Cannot end call — Twilio credentials not configured on this "
+            "instance. Ask the caller to hang up when they're ready.",
+        )
+
+    # Auto-create a high-risk escalation before hanging up so ops has a trail.
+    # Non-fatal on failure — the call ends either way.
+    esc_body = {
+        "issue_for_human": (
+            f"Call ended via end_call. Reason: {reason}. call_sid={call_sid}. "
+            f"from={session.get('from_number') or 'not provided'}. "
+            f"abuse_strikes={session['abuse_strikes']}. "
+            "Review recording + transcript for context."
+        ),
+        "actions_taken": "Delivered abuse-ladder warnings per CX-7; terminated call.",
+        "mark_high_risk": True,
+    }
+    customer = session.get("customer") or {}
+    if customer.get("customer_id"):
+        esc_body["customer_id"] = customer["customer_id"]
+    try:
+        await call_mock("POST", "/escalations", json_body=esc_body)
+    except Exception as e:
+        log.warning(f"end_call: pre-hangup escalation failed (non-fatal): {e}")
+
+    # Twilio REST API — Calls resource, Status=completed to terminate.
+    twilio_url = (
+        f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}"
+        f"/Calls/{call_sid}.json"
+    )
+    auth_token = base64.b64encode(
+        f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("ascii")
+    ).decode("ascii")
+
+    import httpx
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            r = await client.post(
+                twilio_url,
+                headers={
+                    "Authorization": f"Basic {auth_token}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data={"Status": "completed"},
+            )
+        except httpx.HTTPError as e:
+            log.error(f"end_call: Twilio HTTP error: {e.__class__.__name__}: {e}")
+            return _error(
+                "twilio_unreachable",
+                f"Could not reach Twilio to end the call: {e.__class__.__name__}. "
+                "Ask the caller to hang up when they're ready.",
+            )
+
+    if r.status_code >= 400:
+        log.error(f"end_call: Twilio returned {r.status_code}: {r.text[:200]}")
+        return _error(
+            f"twilio_{r.status_code}",
+            f"Twilio refused the hang-up request (HTTP {r.status_code}). "
+            "Ask the caller to hang up when they're ready.",
+        )
+
+    log.info(f"end_call: Twilio confirmed hang-up for call_sid={call_sid}")
+    return {
+        "ok": True,
+        "call_ending": True,
+        "spoken_line": "Thank you. Goodbye.",
+        "_note": (
+            "The Twilio side will close the Media Stream within ~1s. Speak "
+            "the spoken_line briefly if you haven't already; do not attempt "
+            "further tool calls."
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Dispatch
 # --------------------------------------------------------------------------- #
 _HANDLERS = {
@@ -792,6 +969,7 @@ _HANDLERS = {
     "full_order_refund":            full_order_refund,
     "create_escalation":            create_escalation,
     "save_transcript":              save_transcript,
+    "end_call":                     end_call,
 }
 
 # Tools that may run pre-verification.
@@ -800,6 +978,7 @@ _HANDLERS = {
 #   verify_identity — how identity gets proven.
 #   create_escalation — has an unauth-caller fallback path with breadcrumbs.
 #   save_transcript — end-of-call persistence, runs regardless of auth outcome.
+#   end_call — abuse can happen before verify; hangup must not require verify.
 # Everything else is post-verification only. See DECISIONS.md draft
 # "Located vs. verified" for the security rationale.
 _PRE_AUTH_TOOLS = {
@@ -807,6 +986,7 @@ _PRE_AUTH_TOOLS = {
     "verify_identity",
     "create_escalation",
     "save_transcript",
+    "end_call",
 }
 
 

@@ -118,7 +118,7 @@ With Realtime, conversational turns (no tool) are ~0.5–0.8s — under the ~1s 
 - **Full refund side effect:** Silently cancels unfulfilled orders — surface both effects to caller
 - **Cancel-order 409:** Don't promise cancel before checking fulfillment_status; fall back to refund
 
-## Current state (as of end of Day 4 — auth state machine live, tool layer gated)
+## Current state (as of end of Day 5 — full persona live, coupled auth-greeting fix landed, TOOL-END wired)
 ### Days 1–2 (infra + bridge)
 - ✅ Twilio ↔ OpenAI Realtime bridge, GA schema (nested audio config, correct event names)
 - ✅ Bridge deployed: Fly.io app `nn-voice-agent`, `iad`, single-stage Dockerfile, no scale-to-zero, 2 machines warm
@@ -139,7 +139,7 @@ With Realtime, conversational turns (no tool) are ~0.5–0.8s — under the ~1s 
 
 ### Day 4 (auth state machine + tool gating) — closed
 - ✅ **Twilio `From` capture** — `/incoming-call` embeds `From` via TwiML `<Parameter>`; bridge reads it from `customParameters` on the `start` event into `session["from_number"]`.
-- ✅ **Tier-0 auto-lookup** in bridge `start` branch (before greeting): on caller-ID match, `session["tier0_hit"]` flips true, greeting personalizes by first name ("Hi Margaret, this is Ashley — am I speaking with Margaret?"). On miss, generic greeting + system-context message steers Ashley to Tier-1.
+- ✅ **Tier-0 auto-lookup** in bridge `start` branch (before greeting): on caller-ID match, `session["tier0_hit"]` flips true. *(Greeting phrasing itself was rewritten in Day 5 — see below.)* On miss, generic greeting + system-context message steers Ashley to Tier-1.
 - ✅ **Tier-1 fallback** via `customer_lookup(order_number=…|email=…)` — evaluator path (unseeded number) and `cust_006` (`phone: null`) both work.
 - ✅ **`verify_identity` tool** — challenge kinds: `caller_id_confirm` (Tier-0 only, refused otherwise with `code=caller_id_didnt_match`), `zip` (any on-file address — sub OR order — with digits-only normalize), `email` (case-insensitive), `order_name` (digits-only), `card_last_four` (SALE-txn only — REFUND has null card, IFACE gotcha #7). `line_item_title` deliberately excluded (~5 SKU catalog + loose match = too low entropy).
 - ✅ **Dispatch-layer gate** — `handlers.dispatch()` refuses everything but `{customer_lookup, verify_identity, create_escalation, save_transcript}` when `session["verified"]` is False. `code=verification_required` returned; the mock is never touched. Reads gated too, not just mutations.
@@ -152,9 +152,21 @@ With Realtime, conversational turns (no tool) are ~0.5–0.8s — under the ~1s 
 - ✅ **TESTING.md Section F (F1–F8)** — live-call test suite added with per-test log signals + SSH bonus-checks.
 - ✅ **DECISIONS.md** — two new draft entries: "Located vs. verified + dispatch-gate" and "Order name as moderate-strength knowledge factor" (🚧 DRAFT — REVIEW AND REWORD).
 
+### Day 5 (CX/persona prompt + TOOL-END + coupled auth-greeting fix) — closed
+- ✅ **SYSTEM_MESSAGE replaced** — Day-1 placeholder → full structured persona. Sections: persona/voice-format, identity verification (updated for open greeting), CX cadence (empathy sandwich, mirror-vs-reframe, yield-advance, cue-to-switch, power-phrases-with-truthfulness-gate, narrate-the-write), retention micro-sequence (RETN-1/RETN-2 one-and-done), product-knowledge block (KNOW-1) for the 5 seeded SKUs sourced from labels + AIA style (never AIA literal doses), SAFE-3 guardrail with BROAD SAFE-1 trigger (any wellness/health-adjacent phrasing → cancel-with-`reason=other` + medical follow-up + skip retention), billing/refund (EXPL-1), CX-7 abuse ladder, Realtime-emotion-tag caveat.
+- ✅ **Truthfulness gate** — SYSTEM_MESSAGE forbids "let me talk to my manager" / "check with my supervisor" / "VIP customer" phrasing. AIA conv 03's fictional-manager framing replaced with honest concession framing ("Here's the best I can do — 20% lifetime discount"). Real outcome, no invented authority.
+- ✅ **TOOL-END wired.** New `end_call(reason)` tool. Handler posts to Twilio REST API (Calls/{CallSid}.json?Status=completed) using `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` env. Auto-creates high-risk `create_escalation` server-side before hangup (audit trail). Prompt-gated (SYSTEM_MESSAGE CX-7 3-step ladder), `session["abuse_strikes"]` counter incremented on every attempt for observability. In `_PRE_AUTH_TOOLS` — abuse can happen pre-verify.
+- ✅ **Register-shift dispatch** in `bridge.py`. After SAFE-1 cancel (`reason="other"`) or `end_call`, the follow-up `response.create` includes a per-response `instructions` string nudging warmer/slower prosody. Risk #9 workaround for no-emotion-tags.
+- ✅ **COUPLED AUTH-GREETING FIX (bundled, non-splittable) — both landed together:**
+  - **(1)** Tier-0 greeting is now OPEN regardless of Tier-0 hit. Bridge instructions never volunteer the located name ("who do I have the pleasure of speaking with?" / "am I speaking with the account holder?"). The located `first_name` stays in the system-context message so the model knows who to verify against; it's just not spoken in the greeting. Fixes the F6 name-leak and the "greeting-as-assertion" CX-6 violation.
+  - **(2)** `_is_affirmative` tightened. Old substring-match `_AFFIRMATIVE_WORDS` (which contained "this is" and "speaking") replaced with `_AFFIRMATIVE_TOKENS` + `_STOP_TOKENS` + `_MULTI_WORD_AFFIRMATIVES`. New logic: whole-word first-name check OR every token in the affirmative-or-stop union. "This is Bob" against `first_name="Margaret"` now returns `verification_failed`. AUTH-17 is the regression guard. **Shipping (1) without (2) would have opened a Tier-0 auth bypass** — anyone claiming to be the holder ("This is [any name]") would have verified.
+- ✅ **6 new AUTH tests** — AUTH-17 (impostor ship-block), AUTH-18 ("This is Margaret" verifies), AUTH-19 (bare "yes"), AUTH-20 (bare name), AUTH-21 ("Yeah, Bob"). All green.
+- ✅ **END-1 test** — end_call handler shape, `_PRE_AUTH_TOOLS` inclusion, graceful missing-creds path, dispatch-gate allows pre-verify. All green.
+- ✅ **TESTING.md Section G (G1–G7)** — CX/persona live-call suite. G3 is the live-call regression for AUTH-17. G5/G5b/G5c triangulate the SAFE-1 boundary (clear symptom / ambiguous phrasing / pure preference respectively). F6 updated to "landed" status.
+- ✅ **DECISIONS.md** — three new 🚧 DRAFT entries: "Truthfulness gate — no fake manager", "SAFE-1 broad-trigger", "`end_call` — prompt-gated for Day 5". Greeting-phrasing paragraph in draft #1 updated to reflect landed.
+
 ### Pending / next
-- ⬜ **Day 5** — CX prompt content, product-knowledge block (KNOW-1), health guardrail (SAFE-3), TOOL-END (Twilio hangup for CX-7)
-- ⬜ **Day 6** — deterministic filler on tool dispatch (`TODO Day 6` marker in `bridge.py`), P1 tools TOOL-4/7/9/12/13, VAD tuning after quiet-room retest
+- ⬜ **Day 6** — deterministic filler on tool dispatch (`TODO Day 6` marker in `bridge.py`), P1 tools TOOL-4/7/9/12/13, VAD tuning after quiet-room retest, possible handler-side `abuse_strikes` gate on `end_call` if G7 reveals drift
 - ⬜ **Day 7** — call-review UI (bridge-side persistence per Day-2 known-issues note)
 - ⬜ Audio recording (OBS-1) + persisted transcripts (OBS-2) beyond console logging
 
