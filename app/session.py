@@ -66,9 +66,27 @@ def new_session() -> dict:
         # a persisted (cross-call) discount without paying the +1200ms slow-
         # endpoint round-trip. Keyed by subscription_id.
         "subscriptions_by_id": {},
-        # Auth state — populated by Day 4's state machine. Declared here so
-        # the session shape is stable.
+        # ─── Auth state machine (Day 4) ───
+        # `verified` is the single source of truth. Enforcement lives at
+        # `handlers.dispatch()` — see DECISIONS.md draft "Located vs. verified".
+        #
+        # State layering:
+        #   NEW                 → verified=False, candidate_account=None
+        #   LOCATED_UNVERIFIED  → verified=False, candidate_account != None
+        #   VERIFIED            → verified=True,  customer != None
+        #   LOCKED_OUT          → verified=False, auth_attempts >= 3
         "verified": False,
         "customer": None,           # dict from /customers/lookup once verified
-        "candidate_account": None,  # located-but-not-verified account
+        "candidate_account": None,  # located-but-not-verified account (full record)
+        "from_number": None,        # Twilio caller `From`, captured via TwiML <Parameter> on start
+        "auth_attempts": 0,         # Failed verify_identity attempts; cap = 3
+        "tier0_hit": False,         # True if from_number matched a customer via Tier-0 lookup
+                                    # (gates caller_id_confirm challenge — Tier-1 locate cannot use it)
+        "located_via": None,        # "phone" | "email" | "order_number" — which identifier
+                                    # the caller supplied to customer_lookup. Read by
+                                    # verify_identity to refuse same-factor challenges:
+                                    # you cannot verify with the same fact you located with.
+                                    # See DECISIONS.md draft "Located vs. verified" (updated
+                                    # entry — the state check IS the enforcement; prompt hints
+                                    # are not).
     }

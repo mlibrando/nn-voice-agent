@@ -38,12 +38,38 @@ async def health():
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def incoming_call(request: Request):
-    """Twilio webhook — returns TwiML that opens a bidirectional Media Stream."""
+    """Twilio webhook — returns TwiML that opens a bidirectional Media Stream.
+
+    Passes the caller `From` (E.164 phone) through as a Media Stream
+    <Parameter> so the bridge can capture it in `session["from_number"]` on
+    the `start` event. That's the input to Day-4 Tier-0 caller-ID auth.
+    """
     host = request.headers.get("host", "localhost")
+
+    # Twilio POSTs `From` (caller) and `To` (destination) as form fields.
+    # On GET (browser test), From is absent — fall back to empty string;
+    # the bridge treats "no from_number" as Tier-0 miss (evaluator path).
+    from_number = ""
+    if request.method == "POST":
+        form = await request.form()
+        from_number = (form.get("From") or "").strip()
+
+    # XML-escape defensively — TwiML is XML and From is user-supplied.
+    from_xml = (
+        from_number
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="wss://{host}/media-stream" />
+        <Stream url="wss://{host}/media-stream">
+            <Parameter name="from" value="{from_xml}" />
+        </Stream>
     </Connect>
 </Response>"""
     return HTMLResponse(content=twiml, media_type="application/xml")

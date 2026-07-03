@@ -57,7 +57,13 @@ TOOL_DEFINITIONS: list[dict] = [
             "Look up the customer's account by EXACTLY ONE of: phone, email, or "
             "order_number. Zero or multiple identifiers → 400. Returns "
             "{customer, orders, subscriptions} in one round-trip — prefer this "
-            "over calling get_customer_subscriptions separately (the latter is slow)."
+            "over calling get_customer_subscriptions separately (the latter is slow). "
+            "PRE-VERIFICATION SANITIZATION: when session.verified is False, the "
+            "response is minimized to {ok, located, verification_required, "
+            "customer_first_name, _note}. The full record lives in orchestration "
+            "state and is used to check verify_identity answers — you (Ashley) "
+            "must NOT read back address, email, order details, or subscription "
+            "details before verification. Doing so hands the caller the answer."
         ),
         "parameters": {
             "type": "object",
@@ -75,6 +81,58 @@ TOOL_DEFINITIONS: list[dict] = [
                     "description": "Public order name like '#1001'.",
                 },
             },
+            "additionalProperties": False,
+        },
+    },
+    # -------------------------------------------------- TOOL-AUTH (Day 4) --
+    {
+        "type": "function",
+        "name": "verify_identity",
+        "description": (
+            "Check a caller-provided answer against the located account. Call "
+            "this AFTER customer_lookup located an account AND AFTER you asked "
+            "the caller ONE challenge question. Never guess an answer.\n\n"
+            "Challenge kinds:\n"
+            "  - caller_id_confirm — only valid when the caller's phone matched a "
+            "    customer via caller-ID (Tier-0). Loose affirmative match: 'yes', "
+            "    'that's me', or their first name all count. If Tier-0 did not "
+            "    hit, this is REFUSED (you get code=caller_id_didnt_match).\n"
+            "  - zip — any shipping ZIP on the located record (sub OR order). "
+            "    Digits-only compare, any single match passes.\n"
+            "  - email — case-insensitive Customer.email match.\n"
+            "  - order_name — the most recent order's name. Digits-only "
+            "    compare: '#NN1001' / 'NN1001' / '1001' all match.\n"
+            "  - card_last_four — last-4 from a SALE transaction only (refund "
+            "    transactions have null card fields — do not use them).\n\n"
+            "SAME-FACTOR RULE (enforced by the handler, not just guidance):\n"
+            "  - Located via email → `email` challenge is REFUSED with code=same_factor.\n"
+            "  - Located via order_number → `order_name` challenge is REFUSED.\n"
+            "  - Located via phone (Tier-0 caller-ID match) → `caller_id_confirm`\n"
+            "    is ALLOWED as a carve-out: the caller-ID match is an ambient\n"
+            "    physical signal from Twilio, not a caller-supplied claim, so\n"
+            "    combining it with a verbal confirm is two factors.\n"
+            "The sanitized customer_lookup response tells you which challenges\n"
+            "are blocked for the current locate path — pick one that isn't blocked.\n\n"
+            "Failed attempts cap at 3. On code=locked_out the result carries a "
+            "spoken_line (caller-facing verbiage) and an escalation_suggestion "
+            "(prefilled create_escalation args); read the spoken_line to the "
+            "caller and pass escalation_suggestion into create_escalation. Do "
+            "not attempt verification again after locked_out."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "challenge_kind": {
+                    "type": "string",
+                    "enum": ["caller_id_confirm", "zip", "email", "order_name", "card_last_four"],
+                    "description": "Which challenge you asked the caller.",
+                },
+                "given_value": {
+                    "type": "string",
+                    "description": "The caller's verbatim spoken answer. Normalization happens server-side.",
+                },
+            },
+            "required": ["challenge_kind", "given_value"],
             "additionalProperties": False,
         },
     },

@@ -118,7 +118,7 @@ With Realtime, conversational turns (no tool) are ~0.5–0.8s — under the ~1s 
 - **Full refund side effect:** Silently cancels unfulfilled orders — surface both effects to caller
 - **Cancel-order 409:** Don't promise cancel before checking fulfillment_status; fall back to refund
 
-## Current state (as of end of Day 3 — tool layer live, barge-in truly working)
+## Current state (as of end of Day 4 — auth state machine live, tool layer gated)
 ### Days 1–2 (infra + bridge)
 - ✅ Twilio ↔ OpenAI Realtime bridge, GA schema (nested audio config, correct event names)
 - ✅ Bridge deployed: Fly.io app `nn-voice-agent`, `iad`, single-stage Dockerfile, no scale-to-zero, 2 machines warm
@@ -137,8 +137,22 @@ With Realtime, conversational turns (no tool) are ~0.5–0.8s — under the ~1s 
 - ✅ **A1 proactive greeting** (live-verified) — Ashley greets on pickup unprompted; no more "she waits until I say something"
 - ✅ **A2 barge-in during Twilio playback** (live-verified — real CONV-1 fix) — replaced the broken `active_response` scheme with item-id-keyed anchor + Twilio-timestamp elapsed + `audio_sent_ms` clamp. Six consecutive interrupts in one call: `won=elapsed` every time (clamp is a no-op), no `invalid_value` errors, offsets plausibly per-response (760ms – 7400ms based on how long she was allowed to speak). Supersedes the earlier "acceptable for telephony" state — the truncate now keeps OpenAI's item in sync with what the caller actually heard.
 
+### Day 4 (auth state machine + tool gating) — closed
+- ✅ **Twilio `From` capture** — `/incoming-call` embeds `From` via TwiML `<Parameter>`; bridge reads it from `customParameters` on the `start` event into `session["from_number"]`.
+- ✅ **Tier-0 auto-lookup** in bridge `start` branch (before greeting): on caller-ID match, `session["tier0_hit"]` flips true, greeting personalizes by first name ("Hi Margaret, this is Ashley — am I speaking with Margaret?"). On miss, generic greeting + system-context message steers Ashley to Tier-1.
+- ✅ **Tier-1 fallback** via `customer_lookup(order_number=…|email=…)` — evaluator path (unseeded number) and `cust_006` (`phone: null`) both work.
+- ✅ **`verify_identity` tool** — challenge kinds: `caller_id_confirm` (Tier-0 only, refused otherwise with `code=caller_id_didnt_match`), `zip` (any on-file address — sub OR order — with digits-only normalize), `email` (case-insensitive), `order_name` (digits-only), `card_last_four` (SALE-txn only — REFUND has null card, IFACE gotcha #7). `line_item_title` deliberately excluded (~5 SKU catalog + loose match = too low entropy).
+- ✅ **Dispatch-layer gate** — `handlers.dispatch()` refuses everything but `{customer_lookup, verify_identity, create_escalation, save_transcript}` when `session["verified"]` is False. `code=verification_required` returned; the mock is never touched. Reads gated too, not just mutations.
+- ✅ **`customer_lookup` sanitizes pre-verify** — response returns `{ok, located, verification_required, customer_first_name, tier0_hit, _note}` only. Full record cached in `session["candidate_account"]` for the code-side challenge check. No address/email/order data leaked to the model before verification.
+- ✅ **Attempt cap = 3** with **self-contained graceful lockout** — `verify_identity` on the 4th call returns `code=locked_out` with `spoken_line` (caller-facing verbiage), `next_action: "create_escalation"`, and prefilled `escalation_suggestion` args. Escalation fallback survives even a stripped/drifted prompt.
+- ✅ **Order shipping phone never treated as identity signal.** IFACE gotcha #17 respected — no challenge kind reads from `shipping_address.phone`.
+- ✅ **Day-3 deferred hook consumed** — `create_escalation` unauth breadcrumb now includes `from=<number>` alongside `call_sid`.
+- ✅ **SYSTEM_MESSAGE** — minimal auth-flow steering appended (not persona; Day 5 warms it).
+- ✅ **12 auth handler tests** in `scripts/test_tools.py`, all green (proves gate holds before mock is hit, sanitization holds, tier-0 gates caller_id_confirm, cap → locked_out with self-contained payload, cust_006 email/order path works).
+- ✅ **TESTING.md Section F (F1–F8)** — live-call test suite added with per-test log signals + SSH bonus-checks.
+- ✅ **DECISIONS.md** — two new draft entries: "Located vs. verified + dispatch-gate" and "Order name as moderate-strength knowledge factor" (🚧 DRAFT — REVIEW AND REWORD).
+
 ### Pending / next
-- ⬜ **Day 4 — auth state machine.** Session placeholders `verified`/`customer`/`candidate_account` declared, unused. `subscriptions_by_id` cache and the `create_escalation` unauth fallback are both waiting to be consumed by real auth (post-auth, `customer_lookup` populates the cache implicitly; `create_escalation` also gains the Twilio `From` number to attach to `customer_details`).
 - ⬜ **Day 5** — CX prompt content, product-knowledge block (KNOW-1), health guardrail (SAFE-3), TOOL-END (Twilio hangup for CX-7)
 - ⬜ **Day 6** — deterministic filler on tool dispatch (`TODO Day 6` marker in `bridge.py`), P1 tools TOOL-4/7/9/12/13, VAD tuning after quiet-room retest
 - ⬜ **Day 7** — call-review UI (bridge-side persistence per Day-2 known-issues note)
